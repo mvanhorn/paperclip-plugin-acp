@@ -1,0 +1,26 @@
+{
+  "name": "paperclip-plugin-acp",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "paperclipPlugin": {
+    "manifest": "./dist/manifest.js",
+    "worker": "./dist/worker.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "dev": "tsc --watch",
+    "test": "vitest run"
+  },
+  "peerDependencies": {
+    "@paperclipai/plugin-sdk": "^1.0.0",
+    "@paperclipai/shared": "^0.3.0"
+  },
+  "devDependencies": {
+    "@paperclipai/plugin-sdk": "file:../paperclip/packages/plugins/sdk",
+    "@paperclipai/shared": "file:../paperclip/packages/shared",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  }
+}
