@@ -1,5 +1,7 @@
 # paperclip-plugin-acp
 
+[![npm](https://img.shields.io/npm/v/paperclip-plugin-acp)](https://www.npmjs.com/package/paperclip-plugin-acp)
+
 ACP (Agent Client Protocol) runtime plugin for Paperclip. Run Claude Code, Codex, Gemini CLI, and other coding agents from any chat platform through thread-bound sessions.
 
 ## What is ACP?
