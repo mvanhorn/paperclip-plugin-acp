@@ -15,8 +15,8 @@
     "prepublishOnly": "npm run build"
   },
   "peerDependencies": {
-    "@paperclipai/plugin-sdk": ">=2026.0.0",
-    "@paperclipai/shared": ">=2026.0.0"
+    "@paperclipai/plugin-sdk": "*",
+    "@paperclipai/shared": "*"
   },
   "devDependencies": {
     "@paperclipai/plugin-sdk": "^2026.318.0",
