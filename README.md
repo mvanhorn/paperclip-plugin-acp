@@ -4,6 +4,20 @@
 
 ACP (Agent Client Protocol) runtime plugin for Paperclip. Run Claude Code, Codex, Gemini CLI, and other coding agents from any chat platform through thread-bound sessions.
 
+## Install
+
+```bash
+npm install paperclip-plugin-acp
+```
+
+Then register with your Paperclip instance:
+
+```bash
+curl -X POST http://127.0.0.1:3100/api/plugins/install \
+  -H "Content-Type: application/json" \
+  -d '{"packageName":"paperclip-plugin-acp"}'
+```
+
 ## What is ACP?
 
 [Agent Client Protocol](https://agentclientprotocol.com/) is a standard for connecting clients to AI coding agents. Created by Zed Industries, it's supported by Claude Code, Codex CLI, Gemini CLI, OpenCode, and 19+ others. This plugin brings ACP to Paperclip.
