@@ -46,6 +46,16 @@ Chat plugins (Telegram, Discord, Slack) bind threads/topics to ACP sessions via 
 
 Agents must be installed on the Paperclip server. The plugin spawns them as subprocesses.
 
+## 1:N session support
+
+A single chat thread can run up to 5 concurrent agent sessions (configurable via `maxSessionsPerThread`). Spawn multiple agents in the same thread - for example, Claude Code reviewing while Codex implements - and route messages to each by session ID.
+
+Active sessions are stored per-thread as an array. Closed or errored sessions don't count toward the cap. The `acp_status` tool lists all active sessions with uptime, idle time, and binding info.
+
+### Lazy migration from 1:1 format
+
+Existing threads that used the old 1:1 binding format (`acp_{chatId}_{threadId}` key) are migrated automatically on first access. The old key is read, converted to a single-entry sessions array under the new `acp_sessions_{chatId}_{threadId}` key, and the old key is deleted. No manual migration needed.
+
 ## Configuration
 
 | Setting | Default | Description |
@@ -56,6 +66,7 @@ Agents must be installed on the Paperclip server. The plugin spawns them as subp
 | `defaultCwd` | `/workspace` | Working directory for spawned agents |
 | `sessionIdleTimeoutMs` | `1800000` | Close idle sessions after 30 min |
 | `sessionMaxAgeMs` | `28800000` | Close sessions after 8 hours |
+| `maxSessionsPerThread` | `5` | Max concurrent sessions per chat thread |
 
 ## Agent tools
 
@@ -67,12 +78,32 @@ The plugin exposes these tools to Paperclip agents:
 - `acp_cancel` - Cancel the current turn
 - `acp_close` - Close a session and remove bindings
 
-## Event bus
+## Cross-plugin event system
 
-Chat plugins communicate with the ACP plugin via events:
+Chat plugins communicate with the ACP plugin via namespaced events on Paperclip's event bus. Each platform plugin (Telegram, Slack, Discord) emits events under its own namespace:
 
-- `acp:message` - Chat plugin sends a message to an ACP session
-- `acp:output` - ACP plugin sends agent output back to the chat thread
+```
+plugin.paperclip-plugin-telegram.acp-spawn
+plugin.paperclip-plugin-slack.acp-message
+plugin.paperclip-plugin-discord.acp-close
+```
+
+### Inbound events (chat plugin -> ACP)
+
+| Event suffix | Payload | Description |
+|-------------|---------|-------------|
+| `acp-spawn` | `{ agentName, chatId, threadId, companyId, cwd?, mode? }` | Spawn an agent session bound to a thread |
+| `acp-message` | `{ sessionId, text }` | Send a prompt to a running session |
+| `acp-cancel` | `{ sessionId }` | SIGINT the current turn |
+| `acp-close` | `{ sessionId }` | SIGTERM and remove the session |
+
+### Outbound events (ACP -> chat plugin)
+
+| Event | Payload | Description |
+|-------|---------|-------------|
+| `output` | `{ sessionId, type, text?, error?, chatId, threadId }` | Agent output routed back to the originating thread |
+
+The ACP plugin registers listeners for all three platforms on startup. Adding a new platform requires adding its plugin ID to `CHAT_PLATFORM_PLUGINS` in `constants.ts`.
 
 ## Development
 
