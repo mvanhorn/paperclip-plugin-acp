@@ -3,14 +3,19 @@ import {
   runWorker,
   type PluginContext,
   type PluginHealthDiagnostics,
+  type ToolResult,
+  type ToolRunContext,
 } from "@paperclipai/plugin-sdk";
-import { getAgent, listAgents, parseEnabledAgents } from "./agents.js";
+import { getAgent, parseEnabledAgents } from "./agents.js";
 import {
   createSession,
   getSession,
   closeSession,
   resolveBinding,
   updateSession,
+  addSessionToThread,
+  getThreadSessions,
+  updateThreadSessionEntry,
 } from "./session-manager.js";
 import {
   spawnAgent,
@@ -19,11 +24,19 @@ import {
   killSession,
   getActiveSessionIds,
 } from "./acp-spawn.js";
-import { METRIC_NAMES } from "./constants.js";
+import {
+  METRIC_NAMES,
+  CHAT_PLATFORM_PLUGINS,
+  OUTBOUND_EVENTS,
+} from "./constants.js";
 import type {
-  AcpMessageEvent,
   AcpOutputEvent,
   AcpSessionMode,
+  AcpSpawnEvent,
+  AcpMessageCrossEvent,
+  AcpCancelEvent,
+  AcpCloseEvent,
+  AcpSessionEntry,
 } from "./types.js";
 
 type AcpConfig = {
@@ -33,6 +46,7 @@ type AcpConfig = {
   defaultCwd: string;
   sessionIdleTimeoutMs: number;
   sessionMaxAgeMs: number;
+  maxSessionsPerThread: number;
 };
 
 const plugin = definePlugin({
@@ -50,141 +64,229 @@ const plugin = definePlugin({
       return;
     }
 
-    // --- Event bus: receive messages from chat plugins ---
+    // --- Cross-plugin event listeners ---
+    // Each chat platform plugin emits events namespaced as:
+    //   plugin.<platform-plugin-id>.acp-spawn
+    //   plugin.<platform-plugin-id>.acp-message
+    //   plugin.<platform-plugin-id>.acp-cancel
+    //   plugin.<platform-plugin-id>.acp-close
+    // We register listeners for all three platforms.
 
-    ctx.events.on("acp:message", async (rawEvent) => {
-      const event = rawEvent as unknown as AcpMessageEvent;
-      ctx.logger.info("ACP message received", {
-        platform: event.platform,
-        threadId: event.threadId,
-        textLength: event.text?.length,
+    for (const platformPlugin of CHAT_PLATFORM_PLUGINS) {
+      // acp-spawn: create a new subprocess session for a thread
+      ctx.events.on(
+        `plugin.${platformPlugin}.acp-spawn` as `plugin.${string}`,
+        async (rawEvent) => {
+          const event = rawEvent.payload as unknown as AcpSpawnEvent;
+          await handleSpawn(ctx, config, enabledAgents, event, platformPlugin);
+        },
+      );
+
+      // acp-message: route text to a specific session's stdin
+      ctx.events.on(
+        `plugin.${platformPlugin}.acp-message` as `plugin.${string}`,
+        async (rawEvent) => {
+          const event = rawEvent.payload as unknown as AcpMessageCrossEvent;
+          await handleMessage(ctx, event);
+        },
+      );
+
+      // acp-cancel: SIGINT to a specific session
+      ctx.events.on(
+        `plugin.${platformPlugin}.acp-cancel` as `plugin.${string}`,
+        async (rawEvent) => {
+          const event = rawEvent.payload as unknown as AcpCancelEvent;
+          handleCancel(event);
+        },
+      );
+
+      // acp-close: SIGTERM and remove a specific session
+      ctx.events.on(
+        `plugin.${platformPlugin}.acp-close` as `plugin.${string}`,
+        async (rawEvent) => {
+          const event = rawEvent.payload as unknown as AcpCloseEvent;
+          await handleClose(ctx, event);
+        },
+      );
+
+      ctx.logger.debug("Registered cross-plugin listeners", {
+        platform: platformPlugin,
       });
-
-      // Find existing session for this thread
-      const session = await resolveBinding(ctx, event.platform, event.threadId);
-      if (!session) {
-        ctx.logger.debug("No ACP binding for thread", {
-          platform: event.platform,
-          threadId: event.threadId,
-        });
-        return;
-      }
-
-      // Send prompt to the active session
-      const sent = await sendPrompt(ctx, session.sessionId, event.text);
-      if (!sent) {
-        ctx.events.emit("acp:output", {
-          sessionId: session.sessionId,
-          platform: event.platform,
-          threadId: event.threadId,
-          type: "error",
-          error: "Session is not active. Start a new one with /acp spawn.",
-        });
-      }
-    });
+    }
 
     // --- Tool handlers ---
 
-    ctx.tools.register("acp_spawn", async (params) => {
-      const agentId = (params.agent as string) || config.defaultAgent;
-      const mode = (params.mode as AcpSessionMode) || config.defaultMode;
-      const cwd = (params.cwd as string) || config.defaultCwd;
-      const initialPrompt = params.prompt as string | undefined;
+    ctx.tools.register(
+      "acp_spawn",
+      {
+        displayName: "Spawn ACP Agent",
+        description: "Start a new ACP coding agent session.",
+        parametersSchema: {
+          type: "object",
+          properties: {
+            agent: { type: "string" },
+            mode: { type: "string" },
+            cwd: { type: "string" },
+            prompt: { type: "string" },
+          },
+        },
+      },
+      async (params: unknown, runCtx: ToolRunContext): Promise<ToolResult> => {
+        const p = params as Record<string, unknown>;
+        const agentId = (p.agent as string) || config.defaultAgent;
+        const mode = (p.mode as AcpSessionMode) || config.defaultMode;
+        const cwd = (p.cwd as string) || config.defaultCwd;
+        const initialPrompt = p.prompt as string | undefined;
 
-      const agent = getAgent(agentId);
-      if (!agent) {
-        return {
-          success: false,
-          error: `Unknown agent: ${agentId}. Available: ${enabledAgents.map((a) => a.id).join(", ")}`,
-        };
-      }
-
-      const enabled = enabledAgents.find((a) => a.id === agentId);
-      if (!enabled) {
-        return {
-          success: false,
-          error: `Agent ${agentId} is not enabled. Enabled: ${enabledAgents.map((a) => a.id).join(", ")}`,
-        };
-      }
-
-      const session = await createSession(ctx, { agentId, mode, cwd });
-
-      const outputHandler = (event: AcpOutputEvent) => {
-        ctx.events.emit("acp:output", {
-          ...event,
-          platform: session.binding?.platform,
-          threadId: session.binding?.threadId,
-        });
-      };
-
-      await spawnAgent(ctx, session, outputHandler);
-
-      if (initialPrompt) {
-        await sendPrompt(ctx, session.sessionId, initialPrompt);
-      }
-
-      return {
-        success: true,
-        sessionId: session.sessionId,
-        agent: agent.displayName,
-        mode,
-        cwd,
-      };
-    });
-
-    ctx.tools.register("acp_status", async () => {
-      const activeIds = getActiveSessionIds();
-      const sessions = [];
-
-      for (const id of activeIds) {
-        const session = await getSession(ctx, id);
-        if (session) {
-          sessions.push({
-            sessionId: session.sessionId,
-            agent: session.agentId,
-            mode: session.mode,
-            state: session.state,
-            cwd: session.cwd,
-            uptime: Math.round((Date.now() - session.createdAt) / 1000),
-            idleFor: Math.round((Date.now() - session.lastActivityAt) / 1000),
-            binding: session.binding
-              ? `${session.binding.platform}:${session.binding.threadId}`
-              : null,
-          });
+        const agent = getAgent(agentId);
+        if (!agent) {
+          return {
+            error: `Unknown agent: ${agentId}. Available: ${enabledAgents.map((a) => a.id).join(", ")}`,
+          };
         }
-      }
 
-      return { activeSessions: sessions.length, sessions };
-    });
+        const enabled = enabledAgents.find((a) => a.id === agentId);
+        if (!enabled) {
+          return {
+            error: `Agent ${agentId} is not enabled. Enabled: ${enabledAgents.map((a) => a.id).join(", ")}`,
+          };
+        }
 
-    ctx.tools.register("acp_send", async (params) => {
-      const sessionId = params.sessionId as string;
-      const text = params.text as string;
+        const session = await createSession(ctx, { agentId, mode, cwd });
 
-      if (!sessionId || !text) {
-        return { success: false, error: "sessionId and text are required" };
-      }
+        const outputHandler = (event: AcpOutputEvent) => {
+          ctx.events.emit(OUTBOUND_EVENTS.output, runCtx.companyId, {
+            ...event,
+            platform: session.binding?.platform,
+            threadId: session.binding?.threadId,
+          });
+        };
 
-      const sent = await sendPrompt(ctx, sessionId, text);
-      return { success: sent };
-    });
+        await spawnAgent(ctx, session, outputHandler);
 
-    ctx.tools.register("acp_cancel", async (params) => {
-      const sessionId = params.sessionId as string;
-      const cancelled = cancelSession(sessionId);
-      return { success: cancelled };
-    });
+        if (initialPrompt) {
+          await sendPrompt(ctx, session.sessionId, initialPrompt);
+        }
 
-    ctx.tools.register("acp_close", async (params) => {
-      const sessionId = params.sessionId as string;
-      killSession(sessionId);
-      await closeSession(ctx, sessionId);
-      return { success: true };
-    });
+        return {
+          data: {
+            success: true,
+            sessionId: session.sessionId,
+            agent: agent.displayName,
+            mode,
+            cwd,
+          },
+        };
+      },
+    );
+
+    ctx.tools.register(
+      "acp_status",
+      {
+        displayName: "ACP Session Status",
+        description: "List active ACP sessions and their state.",
+        parametersSchema: { type: "object", properties: {} },
+      },
+      async (_params: unknown, _runCtx: ToolRunContext): Promise<ToolResult> => {
+        const activeIds = getActiveSessionIds();
+        const sessions = [];
+
+        for (const id of activeIds) {
+          const session = await getSession(ctx, id);
+          if (session) {
+            sessions.push({
+              sessionId: session.sessionId,
+              agent: session.agentId,
+              mode: session.mode,
+              state: session.state,
+              cwd: session.cwd,
+              uptime: Math.round((Date.now() - session.createdAt) / 1000),
+              idleFor: Math.round((Date.now() - session.lastActivityAt) / 1000),
+              binding: session.binding
+                ? `${session.binding.platform}:${session.binding.threadId}`
+                : null,
+            });
+          }
+        }
+
+        return { data: { activeSessions: sessions.length, sessions } };
+      },
+    );
+
+    ctx.tools.register(
+      "acp_send",
+      {
+        displayName: "Send to ACP Session",
+        description: "Send a prompt to an active ACP session.",
+        parametersSchema: {
+          type: "object",
+          properties: {
+            sessionId: { type: "string" },
+            text: { type: "string" },
+          },
+          required: ["sessionId", "text"],
+        },
+      },
+      async (params: unknown, _runCtx: ToolRunContext): Promise<ToolResult> => {
+        const p = params as Record<string, unknown>;
+        const sessionId = p.sessionId as string;
+        const text = p.text as string;
+
+        if (!sessionId || !text) {
+          return { error: "sessionId and text are required" };
+        }
+
+        const sent = await sendPrompt(ctx, sessionId, text);
+        return { data: { success: sent } };
+      },
+    );
+
+    ctx.tools.register(
+      "acp_cancel",
+      {
+        displayName: "Cancel ACP Session",
+        description: "Cancel the current turn in an ACP session.",
+        parametersSchema: {
+          type: "object",
+          properties: {
+            sessionId: { type: "string" },
+          },
+          required: ["sessionId"],
+        },
+      },
+      async (params: unknown, _runCtx: ToolRunContext): Promise<ToolResult> => {
+        const p = params as Record<string, unknown>;
+        const sessionId = p.sessionId as string;
+        const cancelled = cancelSession(sessionId);
+        return { data: { success: cancelled } };
+      },
+    );
+
+    ctx.tools.register(
+      "acp_close",
+      {
+        displayName: "Close ACP Session",
+        description: "Close an ACP session and remove thread bindings.",
+        parametersSchema: {
+          type: "object",
+          properties: {
+            sessionId: { type: "string" },
+          },
+          required: ["sessionId"],
+        },
+      },
+      async (params: unknown, _runCtx: ToolRunContext): Promise<ToolResult> => {
+        const p = params as Record<string, unknown>;
+        const sessionId = p.sessionId as string;
+        killSession(sessionId);
+        await closeSession(ctx, sessionId);
+        return { data: { success: true } };
+      },
+    );
 
     // --- Cleanup on plugin shutdown ---
 
-    ctx.events.on("plugin.stopping", async () => {
+    ctx.events.on("plugin.stopping" as `plugin.${string}`, async () => {
       const activeIds = getActiveSessionIds();
       for (const id of activeIds) {
         killSession(id);
@@ -197,6 +299,7 @@ const plugin = definePlugin({
 
     ctx.logger.info("ACP runtime plugin started", {
       agents: enabledAgents.map((a) => a.id),
+      listeningTo: CHAT_PLATFORM_PLUGINS as unknown as string[],
     });
   },
 
@@ -207,6 +310,15 @@ const plugin = definePlugin({
         ok: false,
         errors: ["defaultMode must be 'persistent' or 'oneshot'"],
       };
+    }
+    if (c.maxSessionsPerThread != null) {
+      const max = Number(c.maxSessionsPerThread);
+      if (!Number.isFinite(max) || max < 1 || max > 20) {
+        return {
+          ok: false,
+          errors: ["maxSessionsPerThread must be between 1 and 20"],
+        };
+      }
     }
     return { ok: true };
   },
@@ -219,5 +331,153 @@ const plugin = definePlugin({
     };
   },
 });
+
+// --- Cross-plugin event handlers ---
+
+async function handleSpawn(
+  ctx: PluginContext,
+  config: AcpConfig,
+  enabledAgents: ReturnType<typeof parseEnabledAgents>,
+  event: AcpSpawnEvent,
+  sourcePlatform: string,
+): Promise<void> {
+  const agentId = event.agentName || config.defaultAgent;
+  const mode = event.mode || config.defaultMode;
+  const cwd = event.cwd || config.defaultCwd;
+  const companyId = event.companyId;
+
+  ctx.logger.info("Cross-plugin acp-spawn received", {
+    agentId,
+    chatId: event.chatId,
+    threadId: event.threadId,
+    source: sourcePlatform,
+  });
+
+  const agent = getAgent(agentId);
+  if (!agent) {
+    ctx.events.emit(OUTBOUND_EVENTS.output, companyId, {
+      sessionId: null,
+      type: "error",
+      error: `Unknown agent: ${agentId}. Available: ${enabledAgents.map((a) => a.id).join(", ")}`,
+    });
+    return;
+  }
+
+  const enabled = enabledAgents.find((a) => a.id === agentId);
+  if (!enabled) {
+    ctx.events.emit(OUTBOUND_EVENTS.output, companyId, {
+      sessionId: null,
+      type: "error",
+      error: `Agent ${agentId} is not enabled.`,
+    });
+    return;
+  }
+
+  // Create the session with a binding to the thread
+  const binding = {
+    platform: sourcePlatform.replace("paperclip-plugin-", ""),
+    threadId: event.threadId,
+    channelId: event.chatId,
+    boundAt: Date.now(),
+  };
+
+  const session = await createSession(ctx, { agentId, mode, cwd, binding });
+
+  // Build the thread session entry
+  const entry: AcpSessionEntry = {
+    sessionId: session.sessionId,
+    agentName: agentId,
+    agentDisplayName: agent.displayName,
+    spawnedAt: Date.now(),
+    status: "spawning",
+  };
+
+  // Add to thread's 1:N sessions array (enforces cap)
+  const result = await addSessionToThread(
+    ctx,
+    event.chatId,
+    event.threadId,
+    entry,
+    config.maxSessionsPerThread,
+  );
+
+  if (!result.added) {
+    await updateSession(ctx, session.sessionId, { state: "error" });
+    ctx.events.emit(OUTBOUND_EVENTS.output, companyId, {
+      sessionId: session.sessionId,
+      type: "error",
+      error: result.error,
+    });
+    return;
+  }
+
+  // Output handler emits namespaced events with companyId
+  const outputHandler = (outputEvent: AcpOutputEvent) => {
+    ctx.events.emit(OUTBOUND_EVENTS.output, companyId, {
+      ...outputEvent,
+      chatId: event.chatId,
+      threadId: event.threadId,
+    });
+
+    // Keep thread session entry status in sync
+    if (outputEvent.type === "done" || outputEvent.type === "error") {
+      const newStatus = outputEvent.type === "done" ? "closed" : "error";
+      updateThreadSessionEntry(
+        ctx,
+        event.chatId,
+        event.threadId,
+        session.sessionId,
+        { status: newStatus as AcpSessionEntry["status"] },
+      ).catch(() => {});
+    }
+  };
+
+  await spawnAgent(ctx, session, outputHandler);
+
+  // Update the thread entry with PID
+  const refreshed = await getSession(ctx, session.sessionId);
+  if (refreshed?.pid) {
+    await updateThreadSessionEntry(
+      ctx,
+      event.chatId,
+      event.threadId,
+      session.sessionId,
+      { status: "active", pid: refreshed.pid },
+    );
+  }
+}
+
+async function handleMessage(
+  ctx: PluginContext,
+  event: AcpMessageCrossEvent,
+): Promise<void> {
+  ctx.logger.info("Cross-plugin acp-message received", {
+    sessionId: event.sessionId,
+    textLength: event.text?.length,
+  });
+
+  const sent = await sendPrompt(ctx, event.sessionId, event.text);
+  if (!sent) {
+    ctx.logger.warn("Failed to route message to session", {
+      sessionId: event.sessionId,
+    });
+  }
+}
+
+function handleCancel(event: AcpCancelEvent): void {
+  cancelSession(event.sessionId);
+}
+
+async function handleClose(
+  ctx: PluginContext,
+  event: AcpCloseEvent,
+): Promise<void> {
+  ctx.logger.info("Cross-plugin acp-close received", {
+    sessionId: event.sessionId,
+  });
+
+  killSession(event.sessionId);
+  await closeSession(ctx, event.sessionId);
+}
 
 runWorker(plugin, import.meta.url);

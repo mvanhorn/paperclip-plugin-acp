@@ -18,6 +18,7 @@ const manifest: PaperclipPluginManifestV1 = {
     "http.outbound",
     "activity.log.write",
     "metrics.write",
+    "agent.tools.register",
   ],
   entrypoints: {
     worker: "./dist/worker.js",
@@ -62,6 +63,12 @@ const manifest: PaperclipPluginManifestV1 = {
         description: "Close sessions after this many ms regardless of activity.",
         default: DEFAULT_CONFIG.sessionMaxAgeMs,
       },
+      maxSessionsPerThread: {
+        type: "number",
+        title: "Max sessions per thread",
+        description: "Maximum concurrent ACP sessions allowed per chat thread.",
+        default: DEFAULT_CONFIG.maxSessionsPerThread,
+      },
     },
   },
   tools: [
@@ -69,7 +76,7 @@ const manifest: PaperclipPluginManifestV1 = {
       name: "acp_spawn",
       displayName: "Spawn ACP Agent",
       description: "Start a new ACP coding agent session. Agents: claude, codex, gemini, opencode.",
-      parameters: {
+      parametersSchema: {
         type: "object",
         properties: {
           agent: {
@@ -95,13 +102,13 @@ const manifest: PaperclipPluginManifestV1 = {
       name: "acp_status",
       displayName: "ACP Session Status",
       description: "List active ACP sessions and their state.",
-      parameters: { type: "object", properties: {} },
+      parametersSchema: { type: "object", properties: {} },
     },
     {
       name: "acp_send",
       displayName: "Send to ACP Session",
       description: "Send a prompt to an active ACP session.",
-      parameters: {
+      parametersSchema: {
         type: "object",
         properties: {
           sessionId: { type: "string", description: "Target session ID." },
@@ -114,7 +121,7 @@ const manifest: PaperclipPluginManifestV1 = {
       name: "acp_cancel",
       displayName: "Cancel ACP Session",
       description: "Cancel the current turn in an ACP session.",
-      parameters: {
+      parametersSchema: {
         type: "object",
         properties: {
           sessionId: { type: "string", description: "Session to cancel." },
@@ -126,7 +133,7 @@ const manifest: PaperclipPluginManifestV1 = {
       name: "acp_close",
       displayName: "Close ACP Session",
       description: "Close an ACP session and remove thread bindings.",
-      parameters: {
+      parametersSchema: {
         type: "object",
         properties: {
           sessionId: { type: "string", description: "Session to close." },

@@ -20,6 +20,7 @@
   "devDependencies": {
     "@paperclipai/plugin-sdk": "^2026.318.0",
     "@paperclipai/shared": "^2026.318.0",
+    "@types/node": "^25.5.0",
     "typescript": "^5.7.0",
     "vitest": "^3.0.0"
   }

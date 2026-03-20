@@ -1,3 +1,4 @@
+import { execSync } from "node:child_process";
 import type { AcpAgentConfig, AcpAgentId } from "./types.js";
 
 const BUILT_IN_AGENTS: Record<string, AcpAgentConfig> = {
@@ -46,7 +47,6 @@ export function parseEnabledAgents(configStr: string): AcpAgentConfig[] {
 
 export function isAgentInstalled(agent: AcpAgentConfig): boolean {
   try {
-    const { execSync } = require("node:child_process");
     execSync(`which ${agent.command}`, { stdio: "ignore" });
     return true;
   } catch {

@@ -29,6 +29,23 @@ export type AcpBinding = {
   boundAt: number;
 };
 
+/** Entry stored in the 1:N sessions array per thread */
+export type AcpSessionEntry = {
+  sessionId: string;
+  agentName: AcpAgentId;
+  agentDisplayName: string;
+  spawnedAt: number;
+  status: AcpSession["state"];
+  pid?: number;
+};
+
+/** Legacy 1:1 binding from old state format */
+export type LegacyAcpBinding = {
+  sessionId: string;
+  agentName: string;
+  boundAt: number;
+};
+
 export type AcpSpawnRequest = {
   agentId: AcpAgentId;
   mode?: AcpSessionMode;
@@ -60,4 +77,27 @@ export type AcpMessageEvent = {
   text: string;
   attachments?: Array<{ name: string; content: string; mimeType: string }>;
   senderName?: string;
+};
+
+/** Cross-plugin event payloads */
+export type AcpSpawnEvent = {
+  agentName: AcpAgentId;
+  chatId: string;
+  threadId: string;
+  companyId: string;
+  cwd?: string;
+  mode?: AcpSessionMode;
+};
+
+export type AcpMessageCrossEvent = {
+  sessionId: string;
+  text: string;
+};
+
+export type AcpCancelEvent = {
+  sessionId: string;
+};
+
+export type AcpCloseEvent = {
+  sessionId: string;
 };

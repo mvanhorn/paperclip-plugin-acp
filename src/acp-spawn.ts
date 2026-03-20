@@ -76,7 +76,7 @@ export async function spawnAgent(
       });
     });
 
-    child.on("close", async (code) => {
+    child.on("close", async (code: number | null) => {
       activeProcesses.delete(session.sessionId);
       const finalState = code === 0 ? "closed" : "error";
       await updateSession(ctx, session.sessionId, { state: finalState });
@@ -94,7 +94,7 @@ export async function spawnAgent(
       }
     });
 
-    child.on("error", async (err) => {
+    child.on("error", async (err: Error) => {
       activeProcesses.delete(session.sessionId);
       await updateSession(ctx, session.sessionId, { state: "error" });
       await ctx.metrics.write(METRIC_NAMES.spawnErrors, 1);
