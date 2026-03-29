@@ -1,6 +1,6 @@
 {
   "name": "paperclip-plugin-acp",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "type": "module",
   "main": "./dist/index.js",
   "paperclipPlugin": {
@@ -31,5 +31,6 @@
   "repository": {
     "type": "git",
     "url": "https://github.com/mvanhorn/paperclip-plugin-acp"
-  }
+  },
+  "license": "MIT"
 }
