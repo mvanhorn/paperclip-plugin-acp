@@ -58,7 +58,7 @@ const plugin = definePlugin({
       defaultAgent: config.defaultAgent,
     });
 
-    const enabledAgents = parseEnabledAgents(config.enabledAgents);
+    const enabledAgents = parseEnabledAgents(config?.enabledAgents ?? "claude,codex,gemini,opencode");
     if (enabledAgents.length === 0) {
       ctx.logger.warn("No ACP agents enabled");
       return;

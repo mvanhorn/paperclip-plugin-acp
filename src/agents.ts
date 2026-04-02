@@ -40,7 +40,8 @@ export function listAgents(): AcpAgentConfig[] {
   return Object.values(BUILT_IN_AGENTS);
 }
 
-export function parseEnabledAgents(configStr: string): AcpAgentConfig[] {
+export function parseEnabledAgents(configStr: string | undefined | null): AcpAgentConfig[] {
+  if (!configStr) configStr = "claude,codex,gemini,opencode";
   const ids = configStr.split(",").map((s) => s.trim()).filter(Boolean);
   return ids.map((id) => BUILT_IN_AGENTS[id]).filter((a): a is AcpAgentConfig => !!a);
 }
