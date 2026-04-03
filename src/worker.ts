@@ -28,7 +28,13 @@ import {
   METRIC_NAMES,
   CHAT_PLATFORM_PLUGINS,
   OUTBOUND_EVENTS,
+  ATTACHMENT_DEFAULTS,
+  ATTACHMENT_METRIC_NAMES,
 } from "./constants.js";
+import {
+  createAttachment,
+  listAttachments,
+} from "./attachment-manager.js";
 import type {
   AcpOutputEvent,
   AcpSessionMode,
@@ -281,6 +287,100 @@ const plugin = definePlugin({
         killSession(sessionId);
         await closeSession(ctx, sessionId);
         return { data: { success: true } };
+      },
+    );
+
+    // --- Attachment tool handlers ---
+
+    ctx.tools.register(
+      "acp_attach",
+      {
+        displayName: "Attach File to Issue",
+        description:
+          "Upload a file attachment to an issue. Content must be base64-encoded.",
+        parametersSchema: {
+          type: "object",
+          properties: {
+            issueId: { type: "string" },
+            filename: { type: "string" },
+            content: { type: "string" },
+            mimeType: { type: "string" },
+          },
+          required: ["issueId", "filename", "content"],
+        },
+      },
+      async (params: unknown, _runCtx: ToolRunContext): Promise<ToolResult> => {
+        const p = params as Record<string, unknown>;
+        const issueId = p.issueId as string;
+        const filename = p.filename as string;
+        const content = p.content as string;
+        const mimeType = p.mimeType as string | undefined;
+
+        if (!issueId || !filename || !content) {
+          return { error: "issueId, filename, and content are required" };
+        }
+
+        try {
+          const result = await createAttachment(
+            ctx,
+            { issueId, filename, content, mimeType },
+            ATTACHMENT_DEFAULTS.storageDir,
+          );
+          return { data: { success: true, attachment: result } };
+        } catch (err) {
+          ctx.logger.error("Failed to create attachment", {
+            issueId,
+            filename,
+            error: String(err),
+          });
+          await ctx.metrics.write(ATTACHMENT_METRIC_NAMES.attachmentErrors, 1);
+          return {
+            error: err instanceof Error ? err.message : String(err),
+          };
+        }
+      },
+    );
+
+    ctx.tools.register(
+      "acp_attachments",
+      {
+        displayName: "List Issue Attachments",
+        description: "List all file attachments for a given issue.",
+        parametersSchema: {
+          type: "object",
+          properties: {
+            issueId: { type: "string" },
+          },
+          required: ["issueId"],
+        },
+      },
+      async (params: unknown, _runCtx: ToolRunContext): Promise<ToolResult> => {
+        const p = params as Record<string, unknown>;
+        const issueId = p.issueId as string;
+
+        if (!issueId) {
+          return { error: "issueId is required" };
+        }
+
+        try {
+          const attachments = await listAttachments(ctx, issueId);
+          return {
+            data: {
+              issueId,
+              count: attachments.length,
+              attachments,
+            },
+          };
+        } catch (err) {
+          ctx.logger.error("Failed to list attachments", {
+            issueId,
+            error: String(err),
+          });
+          await ctx.metrics.write(ATTACHMENT_METRIC_NAMES.attachmentErrors, 1);
+          return {
+            error: err instanceof Error ? err.message : String(err),
+          };
+        }
       },
     );
 

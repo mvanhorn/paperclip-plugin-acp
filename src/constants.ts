@@ -39,3 +39,20 @@ export const INBOUND_EVENT_SUFFIXES = [
 export const OUTBOUND_EVENTS = {
   output: "output",
 } as const;
+
+// --- Attachment constants ---
+
+export const ATTACHMENT_DEFAULTS = {
+  storageDir: "/tmp/paperclip-attachments",
+  maxFileSizeBytes: 25 * 1024 * 1024, // 25 MB
+  maxAttachmentsPerIssue: 50,
+} as const;
+
+export const ATTACHMENT_STATE_PREFIX = "acp-attachment:";
+export const ATTACHMENT_INDEX_PREFIX = "acp-attachments-index:";
+
+export const ATTACHMENT_METRIC_NAMES = {
+  attachmentsCreated: "acp.attachments.created",
+  attachmentsListed: "acp.attachments.listed",
+  attachmentErrors: "acp.attachments.errors",
+} as const;
