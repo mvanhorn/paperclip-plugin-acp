@@ -101,3 +101,41 @@ export type AcpCancelEvent = {
 export type AcpCloseEvent = {
   sessionId: string;
 };
+
+// --- Attachment types ---
+
+/** Metadata for a single file attachment on an issue */
+export type AcpAttachment = {
+  attachmentId: string;
+  issueId: string;
+  filename: string;
+  mimeType: string;
+  sizeBytes: number;
+  storagePath: string;
+  createdAt: number;
+  createdBy?: string;
+};
+
+/** Response returned when an attachment is created */
+export type AcpAttachmentResponse = {
+  attachmentId: string;
+  issueId: string;
+  filename: string;
+  mimeType: string;
+  sizeBytes: number;
+  url: string;
+  createdAt: number;
+};
+
+/** Parameters for creating an attachment */
+export type AcpAttachRequest = {
+  issueId: string;
+  filename: string;
+  content: string; // base64-encoded file content
+  mimeType?: string;
+};
+
+/** Parameters for listing attachments */
+export type AcpListAttachmentsRequest = {
+  issueId: string;
+};
