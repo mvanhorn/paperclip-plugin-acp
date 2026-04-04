@@ -141,6 +141,51 @@ const manifest: PaperclipPluginManifestV1 = {
         required: ["sessionId"],
       },
     },
+    {
+      name: "acp_attach",
+      displayName: "Attach File to Issue",
+      description:
+        "Upload a file attachment to an issue. Content must be base64-encoded. Returns attachment metadata including ID and URL.",
+      parametersSchema: {
+        type: "object",
+        properties: {
+          issueId: {
+            type: "string",
+            description: "The issue ID to attach the file to.",
+          },
+          filename: {
+            type: "string",
+            description: "Original filename (e.g. report.pdf).",
+          },
+          content: {
+            type: "string",
+            description: "Base64-encoded file content.",
+          },
+          mimeType: {
+            type: "string",
+            description:
+              "MIME type of the file (optional — inferred from filename if omitted).",
+          },
+        },
+        required: ["issueId", "filename", "content"],
+      },
+    },
+    {
+      name: "acp_attachments",
+      displayName: "List Issue Attachments",
+      description:
+        "List all file attachments for a given issue. Returns attachment metadata array.",
+      parametersSchema: {
+        type: "object",
+        properties: {
+          issueId: {
+            type: "string",
+            description: "The issue ID to list attachments for.",
+          },
+        },
+        required: ["issueId"],
+      },
+    },
   ],
 };
 

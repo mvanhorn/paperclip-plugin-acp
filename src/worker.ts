@@ -28,7 +28,14 @@ import {
   METRIC_NAMES,
   CHAT_PLATFORM_PLUGINS,
   OUTBOUND_EVENTS,
+  ATTACHMENT_DEFAULTS,
+  ATTACHMENT_METRIC_NAMES,
+  WEBHOOK_EVENTS,
 } from "./constants.js";
+import {
+  createAttachment,
+  listAttachments,
+} from "./attachment-manager.js";
 import type {
   AcpOutputEvent,
   AcpSessionMode,
@@ -37,7 +44,16 @@ import type {
   AcpCancelEvent,
   AcpCloseEvent,
   AcpSessionEntry,
+  IssueStatusChangeEvent,
+  SessionCompleteEvent,
+  ApprovalRequiredEvent,
 } from "./types.js";
+import {
+  onIssueStatusChange,
+  onSessionComplete,
+  onApprovalRequired,
+  closeWritePool,
+} from "./webhook-hooks.js";
 
 type AcpConfig = {
   enabledAgents: string;
@@ -113,6 +129,58 @@ const plugin = definePlugin({
         platform: platformPlugin,
       });
     }
+
+    // --- Webhook hook listeners ---
+    // These replace polling in the heartbeat loop with event-driven hooks.
+
+    ctx.events.on(
+      WEBHOOK_EVENTS.issueStatusChange as `plugin.${string}`,
+      async (rawEvent) => {
+        const event = rawEvent.payload as unknown as IssueStatusChangeEvent;
+        try {
+          await onIssueStatusChange(ctx, config, event);
+        } catch (err) {
+          ctx.logger.error("Webhook hook on_issue_status_change failed", {
+            issueId: event.issueId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      },
+    );
+
+    ctx.events.on(
+      WEBHOOK_EVENTS.sessionComplete as `plugin.${string}`,
+      async (rawEvent) => {
+        const event = rawEvent.payload as unknown as SessionCompleteEvent;
+        try {
+          await onSessionComplete(ctx, event);
+        } catch (err) {
+          ctx.logger.error("Webhook hook on_session_complete failed", {
+            sessionId: event.sessionId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      },
+    );
+
+    ctx.events.on(
+      WEBHOOK_EVENTS.approvalRequired as `plugin.${string}`,
+      async (rawEvent) => {
+        const event = rawEvent.payload as unknown as ApprovalRequiredEvent;
+        try {
+          await onApprovalRequired(ctx, event);
+        } catch (err) {
+          ctx.logger.error("Webhook hook on_approval_required failed", {
+            issueId: event.issueId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      },
+    );
+
+    ctx.logger.info("Registered webhook hook listeners", {
+      events: Object.values(WEBHOOK_EVENTS),
+    });
 
     // --- Tool handlers ---
 
@@ -284,6 +352,100 @@ const plugin = definePlugin({
       },
     );
 
+    // --- Attachment tool handlers ---
+
+    ctx.tools.register(
+      "acp_attach",
+      {
+        displayName: "Attach File to Issue",
+        description:
+          "Upload a file attachment to an issue. Content must be base64-encoded.",
+        parametersSchema: {
+          type: "object",
+          properties: {
+            issueId: { type: "string" },
+            filename: { type: "string" },
+            content: { type: "string" },
+            mimeType: { type: "string" },
+          },
+          required: ["issueId", "filename", "content"],
+        },
+      },
+      async (params: unknown, _runCtx: ToolRunContext): Promise<ToolResult> => {
+        const p = params as Record<string, unknown>;
+        const issueId = p.issueId as string;
+        const filename = p.filename as string;
+        const content = p.content as string;
+        const mimeType = p.mimeType as string | undefined;
+
+        if (!issueId || !filename || !content) {
+          return { error: "issueId, filename, and content are required" };
+        }
+
+        try {
+          const result = await createAttachment(
+            ctx,
+            { issueId, filename, content, mimeType },
+            ATTACHMENT_DEFAULTS.storageDir,
+          );
+          return { data: { success: true, attachment: result } };
+        } catch (err) {
+          ctx.logger.error("Failed to create attachment", {
+            issueId,
+            filename,
+            error: String(err),
+          });
+          await ctx.metrics.write(ATTACHMENT_METRIC_NAMES.attachmentErrors, 1);
+          return {
+            error: err instanceof Error ? err.message : String(err),
+          };
+        }
+      },
+    );
+
+    ctx.tools.register(
+      "acp_attachments",
+      {
+        displayName: "List Issue Attachments",
+        description: "List all file attachments for a given issue.",
+        parametersSchema: {
+          type: "object",
+          properties: {
+            issueId: { type: "string" },
+          },
+          required: ["issueId"],
+        },
+      },
+      async (params: unknown, _runCtx: ToolRunContext): Promise<ToolResult> => {
+        const p = params as Record<string, unknown>;
+        const issueId = p.issueId as string;
+
+        if (!issueId) {
+          return { error: "issueId is required" };
+        }
+
+        try {
+          const attachments = await listAttachments(ctx, issueId);
+          return {
+            data: {
+              issueId,
+              count: attachments.length,
+              attachments,
+            },
+          };
+        } catch (err) {
+          ctx.logger.error("Failed to list attachments", {
+            issueId,
+            error: String(err),
+          });
+          await ctx.metrics.write(ATTACHMENT_METRIC_NAMES.attachmentErrors, 1);
+          return {
+            error: err instanceof Error ? err.message : String(err),
+          };
+        }
+      },
+    );
+
     // --- Cleanup on plugin shutdown ---
 
     ctx.events.on("plugin.stopping" as `plugin.${string}`, async () => {
@@ -292,6 +454,7 @@ const plugin = definePlugin({
         killSession(id);
         await closeSession(ctx, id);
       }
+      await closeWritePool();
       ctx.logger.info("ACP plugin stopped, cleaned up sessions", {
         count: activeIds.length,
       });
