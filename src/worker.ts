@@ -31,6 +31,7 @@ import {
   ATTACHMENT_DEFAULTS,
   ATTACHMENT_METRIC_NAMES,
   WEBHOOK_EVENTS,
+  ORCHESTRATION_DEFAULTS,
 } from "./constants.js";
 import {
   createAttachment,
@@ -47,6 +48,7 @@ import type {
   IssueStatusChangeEvent,
   SessionCompleteEvent,
   ApprovalRequiredEvent,
+  OrchestrationConfig,
 } from "./types.js";
 import {
   onIssueStatusChange,
@@ -56,6 +58,8 @@ import {
   getCircuitBreakerStates,
   resetCircuitBreakers,
   resetActiveIssueSessions,
+  getPoolStatus,
+  resetRateLimitCooldown,
 } from "./webhook-hooks.js";
 
 type AcpConfig = {
@@ -66,15 +70,20 @@ type AcpConfig = {
   sessionIdleTimeoutMs: number;
   sessionMaxAgeMs: number;
   maxSessionsPerThread: number;
-};
+} & OrchestrationConfig;
 
 const plugin = definePlugin({
   async setup(ctx) {
     const rawConfig = await ctx.config.get();
-    const config = rawConfig as unknown as AcpConfig;
+    const config = {
+      ...ORCHESTRATION_DEFAULTS,
+      ...(rawConfig as unknown as Partial<AcpConfig>),
+    } as AcpConfig;
     ctx.logger.info("ACP plugin loaded", {
       enabledAgents: config.enabledAgents,
       defaultAgent: config.defaultAgent,
+      peakHourEnabled: config.peakHourEnabled,
+      sharedPoolSize: config.sharedPoolSize,
     });
 
     const enabledAgents = parseEnabledAgents(config?.enabledAgents ?? "claude,codex,gemini,opencode");
@@ -156,7 +165,7 @@ const plugin = definePlugin({
       async (rawEvent) => {
         const event = rawEvent.payload as unknown as SessionCompleteEvent;
         try {
-          await onSessionComplete(ctx, event);
+          await onSessionComplete(ctx, event, config);
         } catch (err) {
           ctx.logger.error("Webhook hook on_session_complete failed", {
             sessionId: event.sessionId,
@@ -460,6 +469,7 @@ const plugin = definePlugin({
       await closeWritePool();
       resetCircuitBreakers();
       resetActiveIssueSessions();
+      resetRateLimitCooldown();
       ctx.logger.info("ACP plugin stopped, cleaned up sessions", {
         count: activeIds.length,
       });
@@ -495,11 +505,22 @@ const plugin = definePlugin({
     const activeCount = getActiveSessionIds().length;
     const circuitBreakers = getCircuitBreakerStates();
     const anyCircuitOpen = Object.values(circuitBreakers).some((cb) => cb.isOpen);
+
+    // Phase 2: Include pool status and peak-hour state
+    let poolStatus = null;
+    try {
+      // Use defaults for health check — actual config isn't accessible here
+      poolStatus = await getPoolStatus(ORCHESTRATION_DEFAULTS);
+    } catch {
+      // Non-fatal: pool status is best-effort
+    }
+
     return {
       status: anyCircuitOpen ? "degraded" : "ok",
       details: {
         activeSessions: activeCount,
         circuitBreakers,
+        poolStatus,
       },
     };
   },

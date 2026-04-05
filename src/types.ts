@@ -227,6 +227,70 @@ export type WebhookCircuitBreakerState = {
   isOpen: boolean;
 };
 
+// --- Phase 2: Orchestration migration types ---
+
+/**
+ * Phase 2 orchestration config fields (session caps, peak-hour, rate-limit).
+ * Read from instanceConfigSchema and merged into the main AcpConfig.
+ */
+export type OrchestrationConfig = {
+  peakHourEnabled: boolean;
+  peakHourStart: number;
+  peakHourEnd: number;
+  peakHourTimezone: string;
+  peakHourWeekdaysOnly: boolean;
+  peakSessionsMax: number;
+  peakPriorityThreshold: string;
+  maxBudgetUsd: number;
+  sharedPoolSize: number;
+  rateLimitCooldownMs: number;
+};
+
+/**
+ * Result of a pre-spawn orchestration check.
+ * If `allowed` is false, `reason` explains why the spawn was rejected.
+ */
+export type SpawnGuardResult = {
+  allowed: boolean;
+  reason?: string;
+  /** If the routine run should be marked with a specific skip/fail reason. */
+  routineRunStatus?: "skipped" | "failed";
+  /** Detailed reason code for logging / routine run records. */
+  reasonCode?:
+    | "session_cap_exhausted"
+    | "company_cap_exhausted"
+    | "peak_hour_deferred"
+    | "rate_limit_cooldown"
+    | "rate_limited";
+};
+
+/**
+ * In-memory rate-limit cooldown state (global, not per-company).
+ */
+export type RateLimitCooldownState = {
+  /** Whether the cooldown is currently active. */
+  active: boolean;
+  /** Epoch ms when the cooldown started. */
+  startedAt: number | null;
+  /** Epoch ms when the cooldown expires. */
+  expiresAt: number | null;
+  /** Issue that triggered the rate-limit detection. */
+  triggeredByIssueId: string | null;
+};
+
+/**
+ * Pool status snapshot exposed via the health endpoint.
+ */
+export type PoolStatus = {
+  sharedPoolSize: number;
+  inProgressCount: number;
+  available: number;
+  isPeakHour: boolean;
+  effectiveCap: number;
+  rateLimitCooldownActive: boolean;
+  rateLimitCooldownExpiresAt: number | null;
+};
+
 /**
  * Payload for the on_approval_required webhook hook.
  * Fired when a ticket reaches a state requiring Chairman approval.

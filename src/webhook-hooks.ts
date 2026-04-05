@@ -34,6 +34,12 @@ import {
   METRIC_NAMES,
   WEBHOOK_CIRCUIT_BREAKER_THRESHOLD,
   WEBHOOK_CIRCUIT_BREAKER_COOLDOWN_MS,
+  ORCHESTRATION_DEFAULTS,
+  ORCHESTRATION_METRIC_NAMES,
+  PRIORITY_RANK,
+  RATE_LIMIT_PATTERNS,
+  RATE_LIMIT_JSON_KEYS,
+  RATE_LIMIT_ERROR_TYPES,
 } from "./constants.js";
 import type {
   IssueStatusChangeEvent,
@@ -44,6 +50,10 @@ import type {
   AcpSessionMode,
   PaperclipIssueStatus,
   WebhookCircuitBreakerState,
+  OrchestrationConfig,
+  SpawnGuardResult,
+  RateLimitCooldownState,
+  PoolStatus,
 } from "./types.js";
 
 // ── Shared config type (mirrors worker's AcpConfig) ────────────────────────
@@ -53,7 +63,7 @@ type WebhookHookConfig = {
   defaultMode: AcpSessionMode;
   defaultCwd: string;
   enabledAgents: string;
-};
+} & OrchestrationConfig;
 
 // ── Database helper (lazy connection) ──────────────────────────────────────
 
@@ -250,6 +260,374 @@ export function resetActiveIssueSessions(): void {
   _activeIssueSessionIds.clear();
 }
 
+// ── Phase 2: Rate-limit detection ─────────────────────────────────────────
+
+/**
+ * Detect rate-limit signals in free-form text (stderr/stdout).
+ * Ported from Python nexus/execution/rate_limit.py.
+ */
+export function detectRateLimitInText(text: string): boolean {
+  if (!text) return false;
+  return RATE_LIMIT_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+/**
+ * Detect rate-limit signals in parsed JSON output from Claude Code.
+ */
+export function detectRateLimitInJson(data: Record<string, unknown>): boolean {
+  if (!data || typeof data !== "object") return false;
+
+  // Check top-level boolean flags
+  for (const key of RATE_LIMIT_JSON_KEYS) {
+    if (data[key] === true) return true;
+  }
+
+  // Check error type
+  const errorObj = data.error;
+  if (errorObj && typeof errorObj === "object") {
+    const errRecord = errorObj as Record<string, unknown>;
+    const errorType = String(errRecord.type ?? "").toLowerCase();
+    if ((RATE_LIMIT_ERROR_TYPES as readonly string[]).includes(errorType)) return true;
+    const errorMsg = String(errRecord.message ?? "");
+    if (detectRateLimitInText(errorMsg)) return true;
+  } else if (typeof errorObj === "string") {
+    if (detectRateLimitInText(errorObj)) return true;
+  }
+
+  // Check result text
+  const result = data.result;
+  if (typeof result === "string" && detectRateLimitInText(result)) return true;
+
+  return false;
+}
+
+/**
+ * Unified rate-limit detection across all signal sources.
+ */
+export function detectRateLimit(
+  exitCode: number | null,
+  stderr: string = "",
+  stdout: string = "",
+  parsedJson?: Record<string, unknown>,
+): boolean {
+  // Only check when the process failed (or JSON is provided)
+  if (exitCode === 0 && !parsedJson) return false;
+  if (detectRateLimitInText(stderr)) return true;
+  if (detectRateLimitInText(stdout)) return true;
+  if (parsedJson && detectRateLimitInJson(parsedJson)) return true;
+  return false;
+}
+
+/**
+ * Format a human-readable ticket comment for a rate-limit event.
+ */
+export function formatRateLimitComment(issueId: string): string {
+  const ts = new Date().toISOString().replace("T", " ").replace(/\.\d+Z$/, " UTC");
+  return [
+    "## Rate Limit Detected",
+    "",
+    `**Time:** ${ts}`,
+    `**Ticket:** ${issueId}`,
+    "",
+    "Execution was halted because the Claude API returned a rate-limit error. " +
+      "This is NOT counted as a normal failure for circuit breaker purposes.",
+    "",
+    "**Status:** `blocked` (reason: `rate_limited`)",
+    "",
+    "Retries will resume automatically after the cooldown period expires. " +
+      "No manual intervention required unless this recurs.",
+  ].join("\n");
+}
+
+// ── Phase 2: Rate-limit cooldown state ────────────────────────────────────
+
+let _rateLimitCooldown: RateLimitCooldownState = {
+  active: false,
+  startedAt: null,
+  expiresAt: null,
+  triggeredByIssueId: null,
+};
+
+/**
+ * Get the current rate-limit cooldown state.
+ */
+export function getRateLimitCooldown(): RateLimitCooldownState {
+  return { ..._rateLimitCooldown };
+}
+
+/**
+ * Activate rate-limit cooldown. Halts all further spawns for the configured duration.
+ */
+export function activateRateLimitCooldown(
+  issueId: string,
+  cooldownMs: number,
+): void {
+  const now = Date.now();
+  _rateLimitCooldown = {
+    active: true,
+    startedAt: now,
+    expiresAt: now + cooldownMs,
+    triggeredByIssueId: issueId,
+  };
+}
+
+/**
+ * Check if the rate-limit cooldown is currently active.
+ * Auto-clears when the cooldown period has expired.
+ */
+export function isRateLimitCooldownActive(): boolean {
+  if (!_rateLimitCooldown.active) return false;
+  if (_rateLimitCooldown.expiresAt && Date.now() >= _rateLimitCooldown.expiresAt) {
+    _rateLimitCooldown = { active: false, startedAt: null, expiresAt: null, triggeredByIssueId: null };
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Reset rate-limit cooldown state (used in tests / plugin restart).
+ */
+export function resetRateLimitCooldown(): void {
+  _rateLimitCooldown = { active: false, startedAt: null, expiresAt: null, triggeredByIssueId: null };
+}
+
+// ── Phase 2: Peak-hour detection ──────────────────────────────────────────
+
+/**
+ * Check whether the current time falls within configured peak hours.
+ * Mirrors Python nexus/config.py `is_peak_hour()`.
+ *
+ * @param config - Orchestration config with peak-hour settings
+ * @param now - Override wall clock for testing (must be a Date)
+ */
+export function isPeakHour(config: OrchestrationConfig, now?: Date): boolean {
+  if (!config.peakHourEnabled) return false;
+
+  // Use Intl to get the hour/day in the configured timezone
+  const date = now ?? new Date();
+  const formatter = new Intl.DateTimeFormat("en-US", {
+    timeZone: config.peakHourTimezone,
+    hour: "numeric",
+    hourCycle: "h23",
+    weekday: "short",
+  });
+
+  const parts = formatter.formatToParts(date);
+  const hourPart = parts.find((p) => p.type === "hour");
+  const weekdayPart = parts.find((p) => p.type === "weekday");
+
+  const hour = parseInt(hourPart?.value ?? "0", 10);
+  const weekday = weekdayPart?.value ?? "";
+
+  // Saturday/Sunday check
+  if (config.peakHourWeekdaysOnly && (weekday === "Sat" || weekday === "Sun")) {
+    return false;
+  }
+
+  return hour >= config.peakHourStart && hour < config.peakHourEnd;
+}
+
+// ── Phase 2: Session pool query ───────────────────────────────────────────
+
+/**
+ * Query the Paperclip API for the count of in_progress issues (across all companies or for a specific one).
+ */
+export async function getInProgressCount(companyId?: string): Promise<number> {
+  const params = new URLSearchParams({ status: "in_progress" });
+  if (companyId) params.set("company_id", companyId);
+
+  const url = `${PAPERCLIP_API_BASE}/issues?${params.toString()}`;
+  const res = await fetch(url, {
+    method: "GET",
+    headers: { "Content-Type": "application/json" },
+  });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Paperclip GET issues ${res.status}: ${text.slice(0, 300)}`);
+  }
+
+  const data = (await res.json()) as { total?: number; issues?: unknown[] };
+  // API may return { total } or { issues: [] }
+  return data.total ?? data.issues?.length ?? 0;
+}
+
+// ── Phase 2: Pre-spawn guard (composite) ──────────────────────────────────
+
+/**
+ * Run all pre-spawn orchestration checks before allowing a session to be created.
+ * Returns a SpawnGuardResult indicating whether the spawn is allowed.
+ *
+ * Checks (in order):
+ * 1. Rate-limit cooldown — if active, reject immediately
+ * 2. Session cap — query Paperclip for in_progress count vs pool size
+ * 3. Peak-hour — during peak, reduce cap and filter by priority
+ */
+export async function checkSpawnGuards(
+  ctx: PluginContext,
+  config: WebhookHookConfig,
+  event: IssueStatusChangeEvent,
+): Promise<SpawnGuardResult> {
+  // 1. Rate-limit cooldown check
+  if (isRateLimitCooldownActive()) {
+    const cooldown = getRateLimitCooldown();
+    ctx.logger.warn("Spawn guard: rate-limit cooldown active", {
+      issueId: event.issueId,
+      expiresAt: cooldown.expiresAt ? new Date(cooldown.expiresAt).toISOString() : null,
+    });
+    await ctx.metrics.write(ORCHESTRATION_METRIC_NAMES.rateLimitCooldownActive, 1);
+    return {
+      allowed: false,
+      reason: `Rate-limit cooldown active until ${cooldown.expiresAt ? new Date(cooldown.expiresAt).toISOString() : "unknown"}`,
+      routineRunStatus: "skipped",
+      reasonCode: "rate_limit_cooldown",
+    };
+  }
+
+  // 2. Session cap check
+  await ctx.metrics.write(ORCHESTRATION_METRIC_NAMES.sessionCapChecked, 1);
+  let inProgressCount: number;
+  try {
+    inProgressCount = await getInProgressCount();
+  } catch (err) {
+    // If we can't query the API, allow the spawn (fail-open)
+    ctx.logger.warn("Spawn guard: failed to query in_progress count, allowing spawn", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    inProgressCount = 0;
+  }
+
+  const peak = isPeakHour(config);
+  const effectiveCap = peak ? config.peakSessionsMax : config.sharedPoolSize;
+
+  if (inProgressCount >= effectiveCap) {
+    const reason = peak
+      ? `Peak-hour session cap reached (${inProgressCount}/${effectiveCap})`
+      : `Shared pool exhausted (${inProgressCount}/${effectiveCap})`;
+    ctx.logger.warn("Spawn guard: session cap reached", {
+      issueId: event.issueId,
+      inProgressCount,
+      effectiveCap,
+      isPeakHour: peak,
+    });
+    await ctx.metrics.write(ORCHESTRATION_METRIC_NAMES.sessionCapRejected, 1);
+    return {
+      allowed: false,
+      reason,
+      routineRunStatus: "skipped",
+      reasonCode: peak ? "company_cap_exhausted" : "session_cap_exhausted",
+    };
+  }
+
+  // 3. Peak-hour priority filter
+  if (peak) {
+    await ctx.metrics.write(ORCHESTRATION_METRIC_NAMES.peakHourChecked, 1);
+    const threshold = PRIORITY_RANK[config.peakPriorityThreshold] ?? PRIORITY_RANK.high;
+    const issuePriority = PRIORITY_RANK[event.priority?.toLowerCase()] ?? PRIORITY_RANK.medium;
+
+    if (issuePriority > threshold) {
+      ctx.logger.info("Spawn guard: peak-hour priority filter — deferring low-priority issue", {
+        issueId: event.issueId,
+        issuePriority: event.priority,
+        threshold: config.peakPriorityThreshold,
+      });
+      await ctx.metrics.write(ORCHESTRATION_METRIC_NAMES.peakHourDeferred, 1);
+      return {
+        allowed: false,
+        reason: `Peak hours active — only ${config.peakPriorityThreshold}+ priority allowed (issue is ${event.priority})`,
+        routineRunStatus: "skipped",
+        reasonCode: "peak_hour_deferred",
+      };
+    }
+  }
+
+  ctx.logger.debug("Spawn guard: all checks passed", {
+    issueId: event.issueId,
+    inProgressCount,
+    effectiveCap,
+    isPeakHour: peak,
+  });
+
+  return { allowed: true };
+}
+
+// ── Phase 2: Pool status for health endpoint ──────────────────────────────
+
+/**
+ * Build a pool status snapshot for the health endpoint.
+ */
+export async function getPoolStatus(config: OrchestrationConfig): Promise<PoolStatus> {
+  let inProgressCount = 0;
+  try {
+    inProgressCount = await getInProgressCount();
+  } catch {
+    // If query fails, report 0
+  }
+
+  const peak = isPeakHour(config);
+  const effectiveCap = peak ? config.peakSessionsMax : config.sharedPoolSize;
+  const cooldown = getRateLimitCooldown();
+
+  return {
+    sharedPoolSize: config.sharedPoolSize,
+    inProgressCount,
+    available: Math.max(0, effectiveCap - inProgressCount),
+    isPeakHour: peak,
+    effectiveCap,
+    rateLimitCooldownActive: isRateLimitCooldownActive(),
+    rateLimitCooldownExpiresAt: cooldown.expiresAt,
+  };
+}
+
+// ── Phase 2: Handle rate-limit in session output ──────────────────────────
+
+/**
+ * Process a session completion event for rate-limit detection.
+ * If rate-limit is detected, activates cooldown and posts a comment.
+ * Returns true if a rate-limit was detected.
+ */
+export async function handleRateLimitOnComplete(
+  ctx: PluginContext,
+  config: WebhookHookConfig,
+  event: SessionCompleteEvent & { stderr?: string; stdout?: string; parsedJson?: Record<string, unknown> },
+): Promise<boolean> {
+  const isRateLimited = detectRateLimit(
+    event.exitCode,
+    event.stderr ?? "",
+    event.stdout ?? "",
+    event.parsedJson,
+  );
+
+  if (!isRateLimited) return false;
+
+  ctx.logger.warn("Rate-limit detected in session output", {
+    sessionId: event.sessionId,
+    issueId: event.issueId,
+    companyId: event.companyId,
+  });
+
+  await ctx.metrics.write(ORCHESTRATION_METRIC_NAMES.rateLimitDetected, 1);
+
+  // Activate cooldown
+  activateRateLimitCooldown(event.issueId, config.rateLimitCooldownMs);
+
+  // Post comment on the issue
+  try {
+    const comment = formatRateLimitComment(event.issueId);
+    await paperclipPost(`/issues/${event.issueId}/comments`, {
+      body: comment,
+      author: "acp-plugin",
+    });
+  } catch (err) {
+    ctx.logger.error("Failed to post rate-limit comment", {
+      issueId: event.issueId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+
+  return true;
+}
+
 // ── Hook 1: on_issue_status_change ─────────────────────────────────────────
 
 /**
@@ -314,6 +692,17 @@ export async function onIssueStatusChange(
       circuitBreaker: getCircuitBreaker(event.companyId),
     });
     await ctx.metrics.write(WEBHOOK_METRIC_NAMES.issueStatusChangeCircuitOpen, 1);
+    return { sessionId: null, spawned: false };
+  }
+
+  // Phase 2: Pre-spawn orchestration guards (session cap, peak-hour, rate-limit)
+  const guardResult = await checkSpawnGuards(ctx, config, event);
+  if (!guardResult.allowed) {
+    ctx.logger.info("Webhook: spawn guard rejected", {
+      issueId: event.issueId,
+      reason: guardResult.reason,
+      reasonCode: guardResult.reasonCode,
+    });
     return { sessionId: null, spawned: false };
   }
 
@@ -430,8 +819,9 @@ function buildTicketPrompt(event: IssueStatusChangeEvent): string {
  */
 export async function onSessionComplete(
   ctx: PluginContext,
-  event: SessionCompleteEvent,
-): Promise<{ recorded: boolean; statusUpdated: boolean }> {
+  event: SessionCompleteEvent & { stderr?: string; stdout?: string; parsedJson?: Record<string, unknown> },
+  config?: WebhookHookConfig,
+): Promise<{ recorded: boolean; statusUpdated: boolean; rateLimited?: boolean }> {
   ctx.logger.info("Webhook: session complete", {
     sessionId: event.sessionId,
     issueId: event.issueId,
@@ -442,8 +832,21 @@ export async function onSessionComplete(
 
   let recorded = false;
   let statusUpdated = false;
+  let rateLimited = false;
 
   try {
+    // Phase 2: Check for rate-limit in session output
+    if (config) {
+      rateLimited = await handleRateLimitOnComplete(ctx, config, event);
+      if (rateLimited) {
+        // Do NOT count toward circuit breaker (existing behavior from Python heartbeat)
+        ctx.logger.info("Webhook: rate-limit detected — not counting as circuit breaker failure", {
+          sessionId: event.sessionId,
+          issueId: event.issueId,
+        });
+      }
+    }
+
     // 1. Write performance record to PostgreSQL
     const record = buildPerformanceRecord(event);
     await writePerformanceRecord(ctx, record);
@@ -482,7 +885,7 @@ export async function onSessionComplete(
     // 5. v2: Remove issue from dedup tracking so future webhooks can spawn
     untrackIssueSession(event.issueId);
 
-    return { recorded, statusUpdated };
+    return { recorded, statusUpdated, rateLimited };
   } catch (err) {
     await ctx.metrics.write(WEBHOOK_METRIC_NAMES.sessionCompleteErrors, 1);
     ctx.logger.error("Webhook: failed to handle session complete", {

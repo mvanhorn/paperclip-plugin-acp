@@ -115,3 +115,58 @@ export const WEBHOOK_CIRCUIT_BREAKER_THRESHOLD = 3;
 
 /** Cooldown period (ms) after circuit breaker trips before retrying spawns for a company. */
 export const WEBHOOK_CIRCUIT_BREAKER_COOLDOWN_MS = 10 * 60 * 1000; // 10 minutes
+
+// --- Phase 2: Orchestration migration defaults ---
+
+export const ORCHESTRATION_DEFAULTS = {
+  /** Peak-hour scheduling */
+  peakHourEnabled: true,
+  peakHourStart: 14,
+  peakHourEnd: 20,
+  peakHourTimezone: "Europe/Amsterdam",
+  peakHourWeekdaysOnly: true,
+  peakSessionsMax: 2,
+  peakPriorityThreshold: "high" as const,
+
+  /** Session pool / cap */
+  sharedPoolSize: 18,
+  maxBudgetUsd: 5.0,
+
+  /** Rate-limit cooldown (ms) — halt spawns after rate-limit detection */
+  rateLimitCooldownMs: 300_000, // 5 minutes
+} as const;
+
+/** Priority levels ordered from highest to lowest. */
+export const PRIORITY_RANK: Record<string, number> = {
+  critical: 0,
+  high: 1,
+  medium: 2,
+  low: 3,
+};
+
+/** Metric names for Phase 2 orchestration guards. */
+export const ORCHESTRATION_METRIC_NAMES = {
+  sessionCapChecked: "acp.orchestration.session_cap.checked",
+  sessionCapRejected: "acp.orchestration.session_cap.rejected",
+  peakHourChecked: "acp.orchestration.peak_hour.checked",
+  peakHourDeferred: "acp.orchestration.peak_hour.deferred",
+  rateLimitDetected: "acp.orchestration.rate_limit.detected",
+  rateLimitCooldownActive: "acp.orchestration.rate_limit.cooldown_active",
+} as const;
+
+/** Regex patterns for detecting rate-limit errors in session output (ported from Python). */
+export const RATE_LIMIT_PATTERNS: RegExp[] = [
+  /rate[_\-\s]?limit/i,
+  /\b429\b/,
+  /too\s+many\s+requests/i,
+  /overloaded/i,
+  /rate[_\-\s]?exceeded/i,
+  /throttl(?:ed|ing)/i,
+  /capacity[_\-\s]?exceeded/i,
+  /resource[_\-\s]?exhausted/i,
+  /retry[_\-\s]?after/i,
+];
+
+/** JSON keys that signal rate-limiting in Claude Code JSON output. */
+export const RATE_LIMIT_JSON_KEYS = ["rate_limit", "rate_limited", "is_rate_limited"] as const;
+export const RATE_LIMIT_ERROR_TYPES = ["rate_limit_error", "overloaded_error"] as const;
