@@ -79,6 +79,8 @@ export const WEBHOOK_METRIC_NAMES = {
   issueStatusChangeReceived: "acp.webhook.issue_status_change.received",
   issueStatusChangeSpawned: "acp.webhook.issue_status_change.spawned",
   issueStatusChangeErrors: "acp.webhook.issue_status_change.errors",
+  issueStatusChangeDeduplicated: "acp.webhook.issue_status_change.deduplicated",
+  issueStatusChangeCircuitOpen: "acp.webhook.issue_status_change.circuit_open",
   sessionCompleteReceived: "acp.webhook.session_complete.received",
   sessionCompleteRecorded: "acp.webhook.session_complete.recorded",
   sessionCompleteErrors: "acp.webhook.session_complete.errors",
@@ -101,5 +103,15 @@ export const PAPERCLIP_API_BASE =
 export const NEXUS_METRICS_DB =
   process.env.NEXUS_METRICS_DB ?? "postgresql://localhost:5432/nexus_metrics";
 
-/** Statuses that trigger a session spawn when transitioned to. */
-export const SPAWN_TRIGGER_STATUSES = ["in_progress"] as const;
+/** Statuses that trigger a session spawn when transitioned to.
+ * v2: "todo" is the primary trigger (webhook fires immediately on status change).
+ * "in_progress" is kept for backward compatibility with manual transitions. */
+export const SPAWN_TRIGGER_STATUSES = ["todo", "in_progress"] as const;
+
+// --- Webhook v2 constants ---
+
+/** Maximum consecutive spawn failures per company before the circuit breaker trips. */
+export const WEBHOOK_CIRCUIT_BREAKER_THRESHOLD = 3;
+
+/** Cooldown period (ms) after circuit breaker trips before retrying spawns for a company. */
+export const WEBHOOK_CIRCUIT_BREAKER_COOLDOWN_MS = 10 * 60 * 1000; // 10 minutes

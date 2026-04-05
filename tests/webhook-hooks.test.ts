@@ -42,12 +42,26 @@ vi.mock("../src/session-manager.js", () => ({
 vi.mock("../src/acp-spawn.js", () => ({
   spawnAgent: vi.fn().mockResolvedValue(undefined),
   sendPrompt: vi.fn().mockResolvedValue(undefined),
+  getActiveSessionIds: vi.fn().mockReturnValue([]),
 }));
 
 // Import after mocks
-import { onIssueStatusChange, onSessionComplete, onApprovalRequired } from "../src/webhook-hooks.js";
+import {
+  onIssueStatusChange,
+  onSessionComplete,
+  onApprovalRequired,
+  getCircuitBreaker,
+  recordSpawnSuccess,
+  recordSpawnFailure,
+  isCircuitOpen,
+  resetCircuitBreakers,
+  hasActiveSession,
+  trackIssueSession,
+  untrackIssueSession,
+  resetActiveIssueSessions,
+} from "../src/webhook-hooks.js";
 import { createSession, updateSession } from "../src/session-manager.js";
-import { spawnAgent, sendPrompt } from "../src/acp-spawn.js";
+import { spawnAgent, sendPrompt, getActiveSessionIds } from "../src/acp-spawn.js";
 import { Pool } from "pg";
 
 // ── Fixtures ─────────────────────────────────────────────────────────────────
@@ -119,6 +133,10 @@ beforeEach(() => {
   ctx = createMockContext();
   config = makeConfig();
 
+  // Reset v2 state
+  resetCircuitBreakers();
+  resetActiveIssueSessions();
+
   // Mock global.fetch
   fetchMock = vi.fn().mockResolvedValue({
     ok: true,
@@ -139,6 +157,16 @@ beforeEach(() => {
 describe("on_issue_status_change", () => {
   it("spawns a Claude Code session when issue transitions to in_progress", async () => {
     const event = makeIssueEvent();
+    const result = await onIssueStatusChange(ctx, config, event);
+
+    expect(result.spawned).toBe(true);
+    expect(result.sessionId).toBeTruthy();
+    expect(createSession).toHaveBeenCalled();
+    expect(spawnAgent).toHaveBeenCalled();
+  });
+
+  it("spawns a Claude Code session when issue transitions to todo (v2 webhook trigger)", async () => {
+    const event = makeIssueEvent({ newStatus: "todo", previousStatus: "backlog" });
     const result = await onIssueStatusChange(ctx, config, event);
 
     expect(result.spawned).toBe(true);
@@ -684,5 +712,185 @@ describe("buildApprovalComment (via on_approval_required)", () => {
     // The comment should prompt for Cockpit review
     expect(bodyStr).toContain("cockpit");
     expect(bodyStr).toContain("review");
+  });
+});
+
+// ── v2: Auto-transition to in_progress ─────────────────────────────────────
+
+describe("v2: auto-transition to in_progress on todo spawn", () => {
+  it("PATCHes issue status to in_progress after spawning from todo", async () => {
+    const event = makeIssueEvent({ newStatus: "todo", previousStatus: "backlog" });
+    await onIssueStatusChange(ctx, config, event);
+
+    // Should PATCH the issue to in_progress to prevent double-pickup
+    const patchCall = fetchMock.mock.calls.find(
+      (c: any[]) => c[1]?.method === "PATCH" && c[0].includes(`issues/${event.issueId}`),
+    );
+    expect(patchCall).toBeTruthy();
+    const body = JSON.parse(patchCall![1].body);
+    expect(body.status).toBe("in_progress");
+  });
+
+  it("does NOT auto-transition when spawned from in_progress (already there)", async () => {
+    const event = makeIssueEvent({ newStatus: "in_progress", previousStatus: "backlog" });
+    await onIssueStatusChange(ctx, config, event);
+
+    // Should NOT PATCH to in_progress since we're already in_progress
+    const patchCall = fetchMock.mock.calls.find(
+      (c: any[]) => c[1]?.method === "PATCH" && c[0].includes(`issues/${event.issueId}`),
+    );
+    expect(patchCall).toBeUndefined();
+  });
+});
+
+// ── v2: Dedup guard ────────────────────────────────────────────────────────
+
+describe("v2: dedup guard", () => {
+  it("skips spawn when issue already has an active session", async () => {
+    // Simulate active session by tracking the issue
+    trackIssueSession("ISS-100", "sess-existing");
+    (getActiveSessionIds as Mock).mockReturnValue(["sess-existing"]);
+
+    const event = makeIssueEvent();
+    const result = await onIssueStatusChange(ctx, config, event);
+
+    expect(result.spawned).toBe(false);
+    expect(result.sessionId).toBeNull();
+    expect(createSession).not.toHaveBeenCalled();
+  });
+
+  it("writes the deduplicated metric when dedup guard activates", async () => {
+    trackIssueSession("ISS-100", "sess-existing");
+    (getActiveSessionIds as Mock).mockReturnValue(["sess-existing"]);
+
+    const event = makeIssueEvent();
+    await onIssueStatusChange(ctx, config, event);
+
+    const names = ctx.metrics._writes.map((w: any) => w.name);
+    expect(names).toContain("acp.webhook.issue_status_change.deduplicated");
+  });
+
+  it("allows spawn when tracked session is no longer active (stale entry)", async () => {
+    trackIssueSession("ISS-100", "sess-dead");
+    (getActiveSessionIds as Mock).mockReturnValue([]); // session no longer running
+
+    const event = makeIssueEvent();
+    const result = await onIssueStatusChange(ctx, config, event);
+
+    expect(result.spawned).toBe(true);
+    expect(createSession).toHaveBeenCalled();
+  });
+
+  it("tracks new session after successful spawn", async () => {
+    const event = makeIssueEvent();
+    await onIssueStatusChange(ctx, config, event);
+
+    // hasActiveSession should now return true (assuming getActiveSessionIds includes new session)
+    (getActiveSessionIds as Mock).mockReturnValue(["sess-001"]);
+    expect(hasActiveSession("ISS-100")).toBe(true);
+  });
+
+  it("untracks issue session on session complete", async () => {
+    trackIssueSession("ISS-100", "sess-001");
+    (getActiveSessionIds as Mock).mockReturnValue(["sess-001"]);
+    expect(hasActiveSession("ISS-100")).toBe(true);
+
+    // Complete the session
+    const completeEvent = makeSessionCompleteEvent();
+    await onSessionComplete(ctx, completeEvent);
+
+    // Issue should no longer be tracked
+    expect(hasActiveSession("ISS-100")).toBe(false);
+  });
+});
+
+// ── v2: Circuit breaker ────────────────────────────────────────────────────
+
+describe("v2: circuit breaker", () => {
+  it("starts with circuit closed (isOpen = false)", () => {
+    const cb = getCircuitBreaker("company-1");
+    expect(cb.isOpen).toBe(false);
+    expect(cb.consecutiveFailures).toBe(0);
+  });
+
+  it("records failures and trips after 3 consecutive failures", () => {
+    recordSpawnFailure("company-1");
+    expect(getCircuitBreaker("company-1").consecutiveFailures).toBe(1);
+    expect(isCircuitOpen("company-1")).toBe(false);
+
+    recordSpawnFailure("company-1");
+    expect(getCircuitBreaker("company-1").consecutiveFailures).toBe(2);
+    expect(isCircuitOpen("company-1")).toBe(false);
+
+    recordSpawnFailure("company-1");
+    expect(getCircuitBreaker("company-1").consecutiveFailures).toBe(3);
+    expect(isCircuitOpen("company-1")).toBe(true);
+  });
+
+  it("resets on successful spawn", () => {
+    recordSpawnFailure("company-1");
+    recordSpawnFailure("company-1");
+    recordSpawnFailure("company-1");
+    expect(isCircuitOpen("company-1")).toBe(true);
+
+    recordSpawnSuccess("company-1");
+    expect(isCircuitOpen("company-1")).toBe(false);
+    expect(getCircuitBreaker("company-1").consecutiveFailures).toBe(0);
+  });
+
+  it("blocks spawn when circuit is open", async () => {
+    // Trip the circuit
+    recordSpawnFailure("company-1");
+    recordSpawnFailure("company-1");
+    recordSpawnFailure("company-1");
+
+    const event = makeIssueEvent();
+    const result = await onIssueStatusChange(ctx, config, event);
+
+    expect(result.spawned).toBe(false);
+    expect(result.sessionId).toBeNull();
+    expect(createSession).not.toHaveBeenCalled();
+  });
+
+  it("writes circuit_open metric when circuit blocks a spawn", async () => {
+    recordSpawnFailure("company-1");
+    recordSpawnFailure("company-1");
+    recordSpawnFailure("company-1");
+
+    const event = makeIssueEvent();
+    await onIssueStatusChange(ctx, config, event);
+
+    const names = ctx.metrics._writes.map((w: any) => w.name);
+    expect(names).toContain("acp.webhook.issue_status_change.circuit_open");
+  });
+
+  it("records failure in circuit breaker on spawn error", async () => {
+    (createSession as Mock).mockRejectedValueOnce(new Error("spawn failed"));
+
+    const event = makeIssueEvent();
+    await expect(onIssueStatusChange(ctx, config, event)).rejects.toThrow();
+
+    expect(getCircuitBreaker("company-1").consecutiveFailures).toBe(1);
+  });
+
+  it("resets circuit breaker on successful spawn", async () => {
+    // Pre-set some failures (but not tripped)
+    recordSpawnFailure("company-1");
+    recordSpawnFailure("company-1");
+
+    const event = makeIssueEvent();
+    await onIssueStatusChange(ctx, config, event);
+
+    expect(getCircuitBreaker("company-1").consecutiveFailures).toBe(0);
+    expect(getCircuitBreaker("company-1").isOpen).toBe(false);
+  });
+
+  it("isolates circuit breakers per company", () => {
+    recordSpawnFailure("company-1");
+    recordSpawnFailure("company-1");
+    recordSpawnFailure("company-1");
+
+    expect(isCircuitOpen("company-1")).toBe(true);
+    expect(isCircuitOpen("company-2")).toBe(false);
   });
 });
