@@ -30,6 +30,7 @@ import {
   OUTBOUND_EVENTS,
   ATTACHMENT_DEFAULTS,
   ATTACHMENT_METRIC_NAMES,
+  WEBHOOK_EVENTS,
 } from "./constants.js";
 import {
   createAttachment,
@@ -43,7 +44,16 @@ import type {
   AcpCancelEvent,
   AcpCloseEvent,
   AcpSessionEntry,
+  IssueStatusChangeEvent,
+  SessionCompleteEvent,
+  ApprovalRequiredEvent,
 } from "./types.js";
+import {
+  onIssueStatusChange,
+  onSessionComplete,
+  onApprovalRequired,
+  closeWritePool,
+} from "./webhook-hooks.js";
 
 type AcpConfig = {
   enabledAgents: string;
@@ -119,6 +129,58 @@ const plugin = definePlugin({
         platform: platformPlugin,
       });
     }
+
+    // --- Webhook hook listeners ---
+    // These replace polling in the heartbeat loop with event-driven hooks.
+
+    ctx.events.on(
+      WEBHOOK_EVENTS.issueStatusChange as `plugin.${string}`,
+      async (rawEvent) => {
+        const event = rawEvent.payload as unknown as IssueStatusChangeEvent;
+        try {
+          await onIssueStatusChange(ctx, config, event);
+        } catch (err) {
+          ctx.logger.error("Webhook hook on_issue_status_change failed", {
+            issueId: event.issueId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      },
+    );
+
+    ctx.events.on(
+      WEBHOOK_EVENTS.sessionComplete as `plugin.${string}`,
+      async (rawEvent) => {
+        const event = rawEvent.payload as unknown as SessionCompleteEvent;
+        try {
+          await onSessionComplete(ctx, event);
+        } catch (err) {
+          ctx.logger.error("Webhook hook on_session_complete failed", {
+            sessionId: event.sessionId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      },
+    );
+
+    ctx.events.on(
+      WEBHOOK_EVENTS.approvalRequired as `plugin.${string}`,
+      async (rawEvent) => {
+        const event = rawEvent.payload as unknown as ApprovalRequiredEvent;
+        try {
+          await onApprovalRequired(ctx, event);
+        } catch (err) {
+          ctx.logger.error("Webhook hook on_approval_required failed", {
+            issueId: event.issueId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      },
+    );
+
+    ctx.logger.info("Registered webhook hook listeners", {
+      events: Object.values(WEBHOOK_EVENTS),
+    });
 
     // --- Tool handlers ---
 
@@ -392,6 +454,7 @@ const plugin = definePlugin({
         killSession(id);
         await closeSession(ctx, id);
       }
+      await closeWritePool();
       ctx.logger.info("ACP plugin stopped, cleaned up sessions", {
         count: activeIds.length,
       });

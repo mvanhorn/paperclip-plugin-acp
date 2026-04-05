@@ -73,8 +73,10 @@ describe("parseEnabledAgents", () => {
     expect(result.map((a) => a.id)).toEqual(["claude", "codex"]);
   });
 
-  it("returns empty array for empty string", () => {
-    expect(parseEnabledAgents("")).toEqual([]);
+  it("returns all agents for empty string (fallback to defaults)", () => {
+    const result = parseEnabledAgents("");
+    expect(result).toHaveLength(4);
+    expect(result.map((a) => a.id)).toEqual(["claude", "codex", "gemini", "opencode"]);
   });
 
   it("returns empty array for all unknown agents", () => {
