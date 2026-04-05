@@ -1,5 +1,5 @@
 export const PLUGIN_ID = "paperclip-plugin-acp";
-export const PLUGIN_VERSION = "0.2.4";
+export const PLUGIN_VERSION = "0.3.0";
 
 export const DEFAULT_CONFIG = {
   enabledAgents: "claude,codex,gemini,opencode",
