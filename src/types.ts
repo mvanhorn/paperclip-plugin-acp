@@ -215,6 +215,19 @@ export type PerformanceRecord = {
 };
 
 /**
+ * Per-company circuit breaker state for webhook-triggered spawns (v2).
+ * Tracks consecutive failures to prevent runaway spawn attempts.
+ */
+export type WebhookCircuitBreakerState = {
+  /** Number of consecutive spawn failures for this company. */
+  consecutiveFailures: number;
+  /** Timestamp (epoch ms) when the circuit breaker last tripped. */
+  trippedAt: number | null;
+  /** Whether the circuit is currently open (blocking spawns). */
+  isOpen: boolean;
+};
+
+/**
  * Payload for the on_approval_required webhook hook.
  * Fired when a ticket reaches a state requiring Chairman approval.
  */

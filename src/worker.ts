@@ -53,6 +53,9 @@ import {
   onSessionComplete,
   onApprovalRequired,
   closeWritePool,
+  getCircuitBreakerStates,
+  resetCircuitBreakers,
+  resetActiveIssueSessions,
 } from "./webhook-hooks.js";
 
 type AcpConfig = {
@@ -455,6 +458,8 @@ const plugin = definePlugin({
         await closeSession(ctx, id);
       }
       await closeWritePool();
+      resetCircuitBreakers();
+      resetActiveIssueSessions();
       ctx.logger.info("ACP plugin stopped, cleaned up sessions", {
         count: activeIds.length,
       });
@@ -488,9 +493,14 @@ const plugin = definePlugin({
 
   async onHealth(): Promise<PluginHealthDiagnostics> {
     const activeCount = getActiveSessionIds().length;
+    const circuitBreakers = getCircuitBreakerStates();
+    const anyCircuitOpen = Object.values(circuitBreakers).some((cb) => cb.isOpen);
     return {
-      status: "ok",
-      details: { activeSessions: activeCount },
+      status: anyCircuitOpen ? "degraded" : "ok",
+      details: {
+        activeSessions: activeCount,
+        circuitBreakers,
+      },
     };
   },
 });

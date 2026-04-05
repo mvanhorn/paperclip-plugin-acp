@@ -3,9 +3,17 @@
  *
  * Three hooks replace polling in the heartbeat loop:
  *
- * 1. on_issue_status_change  → Spawn a Claude Code session when a ticket moves to in_progress.
+ * 1. on_issue_status_change  → Spawn a Claude Code session when a ticket moves to a trigger
+ *                              status (`todo` in v2, with `in_progress` kept for compat).
+ *                              Auto-transitions issue to `in_progress` after spawn to prevent
+ *                              double-pickup by the cron fallback.
  * 2. on_session_complete     → Write a performance record to PostgreSQL and update Paperclip issue status.
  * 3. on_approval_required    → Surface a Chairman approval request to the Cockpit via event emission.
+ *
+ * v2 additions (PLA-14):
+ * - Dedup guard: prevents re-spawning if a session is already active for the same issue.
+ * - Auto-transition: moves issue from `todo` → `in_progress` immediately after spawn.
+ * - Circuit breaker: tracks consecutive failures per company; trips after 3, with 10-min cooldown.
  *
  * Each hook validates its payload, performs side effects, writes metrics, and emits follow-up events.
  */
@@ -15,7 +23,7 @@ import {
   createSession,
   updateSession,
 } from "./session-manager.js";
-import { spawnAgent } from "./acp-spawn.js";
+import { spawnAgent, getActiveSessionIds } from "./acp-spawn.js";
 import { getAgent, parseEnabledAgents } from "./agents.js";
 import {
   WEBHOOK_METRIC_NAMES,
@@ -24,6 +32,8 @@ import {
   NEXUS_METRICS_DB,
   SPAWN_TRIGGER_STATUSES,
   METRIC_NAMES,
+  WEBHOOK_CIRCUIT_BREAKER_THRESHOLD,
+  WEBHOOK_CIRCUIT_BREAKER_COOLDOWN_MS,
 } from "./constants.js";
 import type {
   IssueStatusChangeEvent,
@@ -33,6 +43,7 @@ import type {
   AcpOutputEvent,
   AcpSessionMode,
   PaperclipIssueStatus,
+  WebhookCircuitBreakerState,
 } from "./types.js";
 
 // ── Shared config type (mirrors worker's AcpConfig) ────────────────────────
@@ -111,13 +122,147 @@ async function paperclipPost(
   }
 }
 
+// ── Circuit breaker (per-company) ─────────────────────────────────────────
+
+/**
+ * In-memory circuit breaker state keyed by companyId.
+ * Tracks consecutive spawn failures to prevent runaway retries.
+ */
+const _circuitBreakers = new Map<string, WebhookCircuitBreakerState>();
+
+/**
+ * Get (or initialise) circuit breaker state for a company.
+ */
+export function getCircuitBreaker(companyId: string): WebhookCircuitBreakerState {
+  let cb = _circuitBreakers.get(companyId);
+  if (!cb) {
+    cb = { consecutiveFailures: 0, trippedAt: null, isOpen: false };
+    _circuitBreakers.set(companyId, cb);
+  }
+  return cb;
+}
+
+/**
+ * Record a spawn success — resets the circuit breaker for the company.
+ */
+export function recordSpawnSuccess(companyId: string): void {
+  _circuitBreakers.set(companyId, {
+    consecutiveFailures: 0,
+    trippedAt: null,
+    isOpen: false,
+  });
+}
+
+/**
+ * Record a spawn failure — increments the failure counter and trips if threshold is met.
+ */
+export function recordSpawnFailure(companyId: string): WebhookCircuitBreakerState {
+  const cb = getCircuitBreaker(companyId);
+  cb.consecutiveFailures += 1;
+  if (cb.consecutiveFailures >= WEBHOOK_CIRCUIT_BREAKER_THRESHOLD) {
+    cb.isOpen = true;
+    cb.trippedAt = Date.now();
+  }
+  _circuitBreakers.set(companyId, cb);
+  return cb;
+}
+
+/**
+ * Check whether the circuit is currently open for a company.
+ * Auto-resets if the cooldown period has elapsed.
+ */
+export function isCircuitOpen(companyId: string): boolean {
+  const cb = getCircuitBreaker(companyId);
+  if (!cb.isOpen) return false;
+
+  // Auto-reset after cooldown
+  if (cb.trippedAt && Date.now() - cb.trippedAt >= WEBHOOK_CIRCUIT_BREAKER_COOLDOWN_MS) {
+    cb.isOpen = false;
+    cb.consecutiveFailures = 0;
+    cb.trippedAt = null;
+    _circuitBreakers.set(companyId, cb);
+    return false;
+  }
+
+  return true;
+}
+
+/**
+ * Return a snapshot of all circuit breaker states (for health diagnostics).
+ */
+export function getCircuitBreakerStates(): Record<string, WebhookCircuitBreakerState> {
+  const result: Record<string, WebhookCircuitBreakerState> = {};
+  for (const [k, v] of _circuitBreakers) {
+    result[k] = { ...v };
+  }
+  return result;
+}
+
+/**
+ * Reset all circuit breakers (used in tests / plugin restart).
+ */
+export function resetCircuitBreakers(): void {
+  _circuitBreakers.clear();
+}
+
+// ── Dedup guard (per-issue active sessions) ───────────────────────────────
+
+/**
+ * In-memory set of issue IDs that currently have an active webhook-spawned session.
+ * Prevents double-spawn when a webhook fires while a session is still running.
+ */
+const _activeIssueSessionIds = new Map<string, string>(); // issueId → sessionId
+
+/**
+ * Check whether an issue already has an active webhook-spawned session.
+ */
+export function hasActiveSession(issueId: string): boolean {
+  const sessionId = _activeIssueSessionIds.get(issueId);
+  if (!sessionId) return false;
+
+  // Verify the session is still alive in the spawn process table
+  const activeIds = getActiveSessionIds();
+  if (activeIds.includes(sessionId)) return true;
+
+  // Session is no longer active — clean up stale entry
+  _activeIssueSessionIds.delete(issueId);
+  return false;
+}
+
+/**
+ * Track that an issue now has an active webhook-spawned session.
+ */
+export function trackIssueSession(issueId: string, sessionId: string): void {
+  _activeIssueSessionIds.set(issueId, sessionId);
+}
+
+/**
+ * Remove an issue from the active tracking (called on session complete).
+ */
+export function untrackIssueSession(issueId: string): void {
+  _activeIssueSessionIds.delete(issueId);
+}
+
+/**
+ * Reset all dedup tracking (used in tests / plugin restart).
+ */
+export function resetActiveIssueSessions(): void {
+  _activeIssueSessionIds.clear();
+}
+
 // ── Hook 1: on_issue_status_change ─────────────────────────────────────────
 
 /**
  * Handle an issue status change webhook.
  *
- * When an issue transitions to `in_progress`, spawns a Claude Code session
- * for that ticket. Other transitions are acknowledged but do not spawn.
+ * v2: When an issue transitions to `todo` (or `in_progress` for compat),
+ * spawns a Claude Code session for that ticket and immediately transitions
+ * the issue to `in_progress` to prevent double-pickup by the cron fallback.
+ *
+ * Guards:
+ * - Dedup: skips if the issue already has an active session.
+ * - Circuit breaker: skips if the company has tripped its failure threshold.
+ * - No-op: skips if previousStatus === newStatus.
  *
  * Returns the spawned session ID, or null if no session was spawned.
  */
@@ -145,11 +290,30 @@ export async function onIssueStatusChange(
     return { sessionId: null, spawned: false };
   }
 
-  // Prevent re-spawn if the issue was already in_progress
+  // Prevent re-spawn if the status hasn't actually changed
   if (event.previousStatus === event.newStatus) {
     ctx.logger.debug("No-op: status unchanged", {
       status: event.newStatus,
     });
+    return { sessionId: null, spawned: false };
+  }
+
+  // v2 dedup guard: skip if a session is already running for this issue
+  if (hasActiveSession(event.issueId)) {
+    ctx.logger.info("Webhook: dedup — session already active for issue", {
+      issueId: event.issueId,
+    });
+    await ctx.metrics.write(WEBHOOK_METRIC_NAMES.issueStatusChangeDeduplicated, 1);
+    return { sessionId: null, spawned: false };
+  }
+
+  // v2 circuit breaker: skip if the company's circuit is open
+  if (isCircuitOpen(event.companyId)) {
+    ctx.logger.warn("Webhook: circuit breaker open for company — skipping spawn", {
+      companyId: event.companyId,
+      circuitBreaker: getCircuitBreaker(event.companyId),
+    });
+    await ctx.metrics.write(WEBHOOK_METRIC_NAMES.issueStatusChangeCircuitOpen, 1);
     return { sessionId: null, spawned: false };
   }
 
@@ -195,6 +359,21 @@ export async function onIssueStatusChange(
     const { sendPrompt } = await import("./acp-spawn.js");
     await sendPrompt(ctx, session.sessionId, prompt);
 
+    // v2: Track the issue→session mapping for dedup
+    trackIssueSession(event.issueId, session.sessionId);
+
+    // v2: Auto-transition issue from `todo` → `in_progress` so the cron
+    // fallback doesn't double-pick this ticket.
+    if (event.newStatus === "todo") {
+      await paperclipPatch(`/issues/${event.issueId}`, { status: "in_progress" });
+      ctx.logger.info("Webhook: auto-transitioned issue to in_progress", {
+        issueId: event.issueId,
+      });
+    }
+
+    // v2: Record success to reset circuit breaker
+    recordSpawnSuccess(event.companyId);
+
     await ctx.metrics.write(WEBHOOK_METRIC_NAMES.issueStatusChangeSpawned, 1);
 
     ctx.logger.info("Webhook: spawned session for ticket", {
@@ -205,6 +384,15 @@ export async function onIssueStatusChange(
 
     return { sessionId: session.sessionId, spawned: true };
   } catch (err) {
+    // v2: Record failure in circuit breaker
+    const cbState = recordSpawnFailure(event.companyId);
+    if (cbState.isOpen) {
+      ctx.logger.error("Webhook: circuit breaker tripped for company", {
+        companyId: event.companyId,
+        consecutiveFailures: cbState.consecutiveFailures,
+      });
+    }
+
     await ctx.metrics.write(WEBHOOK_METRIC_NAMES.issueStatusChangeErrors, 1);
     ctx.logger.error("Webhook: failed to handle issue status change", {
       issueId: event.issueId,
@@ -290,6 +478,9 @@ export async function onSessionComplete(
     await updateSession(ctx, event.sessionId, {
       state: event.success ? "closed" : "error",
     });
+
+    // 5. v2: Remove issue from dedup tracking so future webhooks can spawn
+    untrackIssueSession(event.issueId);
 
     return { recorded, statusUpdated };
   } catch (err) {
