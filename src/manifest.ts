@@ -1,5 +1,5 @@
 import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
-import { DEFAULT_CONFIG, PLUGIN_ID, PLUGIN_VERSION } from "./constants.js";
+import { DEFAULT_CONFIG, ORCHESTRATION_DEFAULTS, PLUGIN_ID, PLUGIN_VERSION } from "./constants.js";
 
 const manifest: PaperclipPluginManifestV1 = {
   id: PLUGIN_ID,
@@ -68,6 +68,67 @@ const manifest: PaperclipPluginManifestV1 = {
         title: "Max sessions per thread",
         description: "Maximum concurrent ACP sessions allowed per chat thread.",
         default: DEFAULT_CONFIG.maxSessionsPerThread,
+      },
+      // --- Phase 2: Orchestration migration config ---
+      peakHourEnabled: {
+        type: "boolean",
+        title: "Enable peak-hour scheduling",
+        description: "When enabled, reduce concurrency and filter by priority during peak hours.",
+        default: ORCHESTRATION_DEFAULTS.peakHourEnabled,
+      },
+      peakHourStart: {
+        type: "number",
+        title: "Peak hour start (0-23)",
+        description: "Hour (in configured timezone) when peak scheduling begins.",
+        default: ORCHESTRATION_DEFAULTS.peakHourStart,
+      },
+      peakHourEnd: {
+        type: "number",
+        title: "Peak hour end (0-23)",
+        description: "Hour (in configured timezone) when peak scheduling ends.",
+        default: ORCHESTRATION_DEFAULTS.peakHourEnd,
+      },
+      peakHourTimezone: {
+        type: "string",
+        title: "Peak hour timezone",
+        description: "IANA timezone for peak-hour calculations (e.g. Europe/Amsterdam).",
+        default: ORCHESTRATION_DEFAULTS.peakHourTimezone,
+      },
+      peakHourWeekdaysOnly: {
+        type: "boolean",
+        title: "Peak hours on weekdays only",
+        description: "When true, weekends are always off-peak regardless of time.",
+        default: ORCHESTRATION_DEFAULTS.peakHourWeekdaysOnly,
+      },
+      peakSessionsMax: {
+        type: "number",
+        title: "Peak session cap",
+        description: "Maximum concurrent sessions during peak hours.",
+        default: ORCHESTRATION_DEFAULTS.peakSessionsMax,
+      },
+      peakPriorityThreshold: {
+        type: "string",
+        title: "Peak priority threshold",
+        description: "Minimum priority level for spawning during peak hours (critical, high, medium, low).",
+        default: ORCHESTRATION_DEFAULTS.peakPriorityThreshold,
+      },
+      maxBudgetUsd: {
+        type: "number",
+        title: "Max budget (USD)",
+        description: "Maximum USD budget for subscription usage tracking.",
+        default: ORCHESTRATION_DEFAULTS.maxBudgetUsd,
+      },
+      sharedPoolSize: {
+        type: "number",
+        title: "Shared session pool size",
+        description: "Total number of shared sessions available across all companies.",
+        default: ORCHESTRATION_DEFAULTS.sharedPoolSize,
+      },
+      rateLimitCooldownMs: {
+        type: "number",
+        title: "Rate-limit cooldown (ms)",
+        description: "Duration to halt spawns after a rate-limit is detected.",
+        default: ORCHESTRATION_DEFAULTS.rateLimitCooldownMs,
       },
     },
   },
