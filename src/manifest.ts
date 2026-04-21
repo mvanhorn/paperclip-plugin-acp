@@ -203,6 +203,22 @@ const manifest: PaperclipPluginManifestV1 = {
       },
     },
     {
+      name: "acp_result",
+      displayName: "Get ACP Session Result",
+      description:
+        "Fetch the final stdout and exit code for a one-shot ACP session that has completed.",
+      parametersSchema: {
+        type: "object",
+        properties: {
+          sessionId: {
+            type: "string",
+            description: "Session ID returned by acp_spawn.",
+          },
+        },
+        required: ["sessionId"],
+      },
+    },
+    {
       name: "acp_attach",
       displayName: "Attach File to Issue",
       description:
