@@ -69,6 +69,20 @@ const manifest: PaperclipPluginManifestV1 = {
         description: "Maximum concurrent ACP sessions allowed per chat thread.",
         default: DEFAULT_CONFIG.maxSessionsPerThread,
       },
+      reaperIntervalMs: {
+        type: "number",
+        title: "Reaper scan interval (ms)",
+        description:
+          "How often the idle/max-age reaper scans active sessions. Must be well under sessionIdleTimeoutMs and sessionMaxAgeMs.",
+        default: DEFAULT_CONFIG.reaperIntervalMs,
+      },
+      sessionRowTtlDays: {
+        type: "number",
+        title: "Session row TTL (days)",
+        description:
+          "TTL for orphaned plugin_state rows (sessions with no in-process entry, e.g. after a worker restart). Scaffolded for a future cross-restart purge that depends on the SDK's state.list API — no consumer reads this yet.",
+        default: DEFAULT_CONFIG.sessionRowTtlDays,
+      },
       // --- Phase 2: Orchestration migration config ---
       peakHourEnabled: {
         type: "boolean",

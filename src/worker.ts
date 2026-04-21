@@ -32,7 +32,9 @@ import {
   ATTACHMENT_METRIC_NAMES,
   WEBHOOK_EVENTS,
   ORCHESTRATION_DEFAULTS,
+  DEFAULT_CONFIG,
 } from "./constants.js";
+import { computeReapReason } from "./reaper.js";
 import {
   createAttachment,
   listAttachments,
@@ -70,6 +72,8 @@ type AcpConfig = {
   sessionIdleTimeoutMs: number;
   sessionMaxAgeMs: number;
   maxSessionsPerThread: number;
+  reaperIntervalMs: number;
+  sessionRowTtlDays: number;
 } & OrchestrationConfig;
 
 const plugin = definePlugin({
@@ -458,9 +462,67 @@ const plugin = definePlugin({
       },
     );
 
+    // --- Session idle/max-age reaper ---
+    // The manifest advertises sessionIdleTimeoutMs and sessionMaxAgeMs, but
+    // without this loop neither was enforced — long-running workers could
+    // accumulate orphaned sessions indefinitely. The reaper scans active
+    // sessions every reaperIntervalMs and terminates any that are past idle
+    // or max-age thresholds. Sessions already in a terminal state are
+    // skipped to avoid racing with the normal close path.
+    const idleTimeoutMs = config.sessionIdleTimeoutMs ?? DEFAULT_CONFIG.sessionIdleTimeoutMs;
+    const maxAgeMs = config.sessionMaxAgeMs ?? DEFAULT_CONFIG.sessionMaxAgeMs;
+    const reaperIntervalMs = config.reaperIntervalMs ?? DEFAULT_CONFIG.reaperIntervalMs;
+
+    // In-flight guard: between killSession (in-memory SIGTERM) and closeSession
+    // (async state write) there's a window where a second reaper tick could
+    // observe the session as still non-terminal and issue duplicate teardown.
+    // This set gates that window within a single process.
+    const reapingInFlight = new Set<string>();
+
+    const reaperHandle = setInterval(async () => {
+      const now = Date.now();
+      const activeIds = getActiveSessionIds();
+      for (const id of activeIds) {
+        if (reapingInFlight.has(id)) continue;
+        try {
+          const sess = await getSession(ctx, id);
+          if (!sess) continue;
+          const reason = computeReapReason(now, sess, idleTimeoutMs, maxAgeMs);
+          if (!reason) continue;
+          reapingInFlight.add(id);
+          ctx.logger.info("Reaping ACP session", {
+            sessionId: id,
+            reason,
+            idleMs: now - (sess.lastActivityAt ?? sess.createdAt ?? 0),
+            ageMs: now - (sess.createdAt ?? 0),
+          });
+          try {
+            killSession(id);
+            await closeSession(ctx, id);
+          } finally {
+            reapingInFlight.delete(id);
+          }
+        } catch (err) {
+          reapingInFlight.delete(id);
+          ctx.logger.error("Reaper iteration failed", {
+            sessionId: id,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+    }, reaperIntervalMs);
+    // Don't keep the event loop alive just for the reaper.
+    reaperHandle.unref?.();
+    ctx.logger.info("ACP reaper started", {
+      idleTimeoutMs,
+      maxAgeMs,
+      reaperIntervalMs,
+    });
+
     // --- Cleanup on plugin shutdown ---
 
     ctx.events.on("plugin.stopping" as `plugin.${string}`, async () => {
+      clearInterval(reaperHandle);
       const activeIds = getActiveSessionIds();
       for (const id of activeIds) {
         killSession(id);
