@@ -34,7 +34,7 @@ import {
   ORCHESTRATION_DEFAULTS,
   DEFAULT_CONFIG,
 } from "./constants.js";
-import { computeReapReason } from "./reaper.js";
+import { computeReapReason, reapSessionIfDue } from "./reaper.js";
 import {
   createAttachment,
   listAttachments,
@@ -484,30 +484,31 @@ const plugin = definePlugin({
       const activeIds = getActiveSessionIds();
       for (const id of activeIds) {
         if (reapingInFlight.has(id)) continue;
+        reapingInFlight.add(id);
         try {
           const sess = await getSession(ctx, id);
           if (!sess) continue;
           const reason = computeReapReason(now, sess, idleTimeoutMs, maxAgeMs);
           if (!reason) continue;
-          reapingInFlight.add(id);
           ctx.logger.info("Reaping ACP session", {
             sessionId: id,
             reason,
             idleMs: now - (sess.lastActivityAt ?? sess.createdAt ?? 0),
             ageMs: now - (sess.createdAt ?? 0),
           });
-          try {
-            killSession(id);
-            await closeSession(ctx, id);
-          } finally {
-            reapingInFlight.delete(id);
-          }
+          await reapSessionIfDue(ctx, id, {
+            killSession,
+            now,
+            idleTimeoutMs,
+            maxAgeMs,
+          });
         } catch (err) {
-          reapingInFlight.delete(id);
           ctx.logger.error("Reaper iteration failed", {
             sessionId: id,
             error: err instanceof Error ? err.message : String(err),
           });
+        } finally {
+          reapingInFlight.delete(id);
         }
       }
     }, reaperIntervalMs);
