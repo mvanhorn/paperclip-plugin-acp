@@ -9,6 +9,12 @@ export const DEFAULT_CONFIG = {
   sessionIdleTimeoutMs: 30 * 60 * 1000, // 30 minutes
   sessionMaxAgeMs: 8 * 60 * 60 * 1000, // 8 hours
   maxSessionsPerThread: 5,
+  // How often the idle/max-age reaper scans active sessions.
+  reaperIntervalMs: 60 * 1000, // 1 minute
+  // TTL for orphaned plugin_state rows for sessions that no longer have an
+  // in-process entry (e.g. after a worker restart). Scaffolded for a future
+  // SDK state.list-driven cross-restart purge — no consumer yet.
+  sessionRowTtlDays: 30,
 };
 
 export const METRIC_NAMES = {
