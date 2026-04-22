@@ -21,6 +21,7 @@ export const METRIC_NAMES = {
   sessionsSpawned: "acp.sessions.spawned",
   sessionsActive: "acp.sessions.active",
   sessionsClosed: "acp.sessions.closed",
+  sessionsReaped: "acp.sessions.reaped",
   promptsSent: "acp.prompts.sent",
   outputsReceived: "acp.outputs.received",
   spawnErrors: "acp.spawn.errors",
