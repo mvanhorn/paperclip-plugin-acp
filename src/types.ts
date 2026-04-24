@@ -8,6 +8,14 @@ export type AcpAgentConfig = {
   args: string[];
   displayName: string;
   description: string;
+  /**
+   * Flags to append when mode="oneshot". If set, the agent is spawned as a
+   * non-interactive one-shot print: stdin is closed immediately after the
+   * initial prompt, the process is expected to exit on its own, and its
+   * stdout is treated as the final result.
+   * Example: claude → ["-p"], codex → ["exec"].
+   */
+  oneshotArgs?: string[];
 };
 
 export type AcpSession = {
@@ -20,6 +28,10 @@ export type AcpSession = {
   state: "spawning" | "active" | "idle" | "closing" | "closed" | "error";
   binding?: AcpBinding;
   pid?: number;
+  /** Aggregated stdout from a one-shot run, set on process close. */
+  finalOutput?: string;
+  /** Exit code captured when the child process terminates (oneshot only). */
+  exitCode?: number | null;
 };
 
 export type AcpBinding = {

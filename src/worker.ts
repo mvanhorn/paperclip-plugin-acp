@@ -246,9 +246,11 @@ const plugin = definePlugin({
           });
         };
 
-        await spawnAgent(ctx, session, outputHandler);
+        await spawnAgent(ctx, session, outputHandler, initialPrompt);
 
-        if (initialPrompt) {
+        // In one-shot mode, `spawnAgent` already wrote the prompt to stdin and
+        // closed it. In persistent mode we still need to send via sendPrompt.
+        if (initialPrompt && session.mode !== "oneshot") {
           await sendPrompt(ctx, session.sessionId, initialPrompt);
         }
 
@@ -365,6 +367,41 @@ const plugin = definePlugin({
         killSession(sessionId);
         await closeSession(ctx, sessionId);
         return { data: { success: true } };
+      },
+    );
+
+    // Fetch the aggregated stdout and exit code of a one-shot session after
+    // the child process has terminated. Returns the session state so callers
+    // can detect still-running or missing sessions without polling acp_status.
+    ctx.tools.register(
+      "acp_result",
+      {
+        displayName: "Get ACP Session Result",
+        description:
+          "Retrieve the final stdout, exit code and state for a one-shot ACP session that has completed.",
+        parametersSchema: {
+          type: "object",
+          properties: {
+            sessionId: { type: "string" },
+          },
+          required: ["sessionId"],
+        },
+      },
+      async (params: unknown, _runCtx: ToolRunContext): Promise<ToolResult> => {
+        const p = params as Record<string, unknown>;
+        const sessionId = p.sessionId as string;
+        if (!sessionId) return { error: "sessionId is required" };
+        const session = await getSession(ctx, sessionId);
+        if (!session) return { error: `Session not found: ${sessionId}` };
+        return {
+          data: {
+            sessionId,
+            state: session.state,
+            mode: session.mode,
+            exitCode: session.exitCode ?? null,
+            output: session.finalOutput ?? null,
+          },
+        };
       },
     );
 
