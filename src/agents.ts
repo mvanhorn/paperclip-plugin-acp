@@ -19,7 +19,7 @@ const BUILT_IN_AGENTS: Record<string, AcpAgentConfig> = {
   gemini: {
     id: "gemini",
     command: "gemini",
-    args: [],
+    args: ["--acp"],
     displayName: "Gemini CLI",
     description: "Google's Gemini CLI - coding agent with Gemini models.",
   },
