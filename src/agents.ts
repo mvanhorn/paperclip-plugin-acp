@@ -6,6 +6,7 @@ const BUILT_IN_AGENTS: Record<string, AcpAgentConfig> = {
     id: "claude",
     command: "claude",
     args: [],
+    oneshotArgs: ["-p"],
     displayName: "Claude Code",
     description: "Anthropic's Claude Code CLI - full coding agent with tools, file editing, and terminal access.",
   },

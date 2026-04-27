@@ -11,6 +11,7 @@ export async function spawnAgent(
   ctx: PluginContext,
   session: AcpSession,
   onOutput: (event: AcpOutputEvent) => void,
+  initialPrompt?: string,
 ): Promise<void> {
   const agent = getAgent(session.agentId);
   if (!agent) {
@@ -23,14 +24,22 @@ export async function spawnAgent(
     return;
   }
 
+  // Resolve args based on session mode. Agents that declare `oneshotArgs`
+  // get spawned in non-interactive one-shot mode when `session.mode === "oneshot"`;
+  // stdin is closed right after the prompt so the child exits on its own.
+  const isOneshot = session.mode === "oneshot" && Array.isArray(agent.oneshotArgs);
+  const spawnArgs = isOneshot ? [...agent.oneshotArgs!, ...agent.args] : agent.args;
+
   ctx.logger.info("Spawning ACP agent", {
     sessionId: session.sessionId,
     agent: agent.id,
     cwd: session.cwd,
+    mode: session.mode,
+    oneshot: isOneshot,
   });
 
   try {
-    const child = spawn(agent.command, agent.args, {
+    const child = spawn(agent.command, spawnArgs, {
       cwd: session.cwd,
       stdio: ["pipe", "pipe", "pipe"],
       env: { ...process.env, TERM: "dumb" },
@@ -44,6 +53,10 @@ export async function spawnAgent(
     await ctx.metrics.write(METRIC_NAMES.sessionsSpawned, 1);
 
     let outputBuffer = "";
+    // Aggregated raw stdout, stored on close for oneshot mode so callers
+    // that don't subscribe to the event stream can still retrieve the
+    // final result via `acp_result`.
+    const oneshotBuffer: string[] = [];
 
     child.stdout?.on("data", (data: Buffer) => {
       outputBuffer += data.toString();
@@ -54,6 +67,7 @@ export async function spawnAgent(
 
       for (const line of lines) {
         if (!line.trim()) continue;
+        if (isOneshot) oneshotBuffer.push(line);
         try {
           const msg = JSON.parse(line);
           handleAgentMessage(ctx, session.sessionId, msg, onOutput);
@@ -79,7 +93,17 @@ export async function spawnAgent(
     child.on("close", async (code: number | null) => {
       activeProcesses.delete(session.sessionId);
       const finalState = code === 0 ? "closed" : "error";
-      await updateSession(ctx, session.sessionId, { state: finalState });
+      // Flush any trailing non-terminated line so it isn't lost.
+      if (isOneshot && outputBuffer.trim().length > 0) {
+        oneshotBuffer.push(outputBuffer);
+        outputBuffer = "";
+      }
+      const update: Partial<AcpSession> = { state: finalState };
+      if (isOneshot) {
+        update.finalOutput = oneshotBuffer.join("\n");
+        update.exitCode = code ?? null;
+      }
+      await updateSession(ctx, session.sessionId, update);
 
       onOutput({
         sessionId: session.sessionId,
@@ -105,6 +129,17 @@ export async function spawnAgent(
         error: `Failed to spawn ${agent.displayName}: ${err.message}`,
       });
     });
+
+    // In one-shot mode, deliver the prompt via stdin and close stdin so the
+    // child process finishes on its own. The `close` handler above will then
+    // mark the session as `closed` and emit the `done` event.
+    if (isOneshot && child.stdin?.writable) {
+      if (initialPrompt) {
+        child.stdin.write(initialPrompt);
+        await ctx.metrics.write(METRIC_NAMES.promptsSent, 1);
+      }
+      child.stdin.end();
+    }
   } catch (err) {
     await updateSession(ctx, session.sessionId, { state: "error" });
     await ctx.metrics.write(METRIC_NAMES.spawnErrors, 1);
