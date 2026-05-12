@@ -109,13 +109,50 @@ The plugin exposes these tools to Paperclip agents:
 | `acp_cancel` | Cancel the current turn (SIGINT) |
 | `acp_close` | Close a session and remove thread bindings |
 
+## Sandbox isolation (v0.6.0+)
+
+Each spawned agent subprocess runs inside a disposable host-isolation
+sandbox so the operator's `~/.claude/` config, hooks, and shell env do
+not bleed into the spawned agent.
+
+What the sandbox enforces:
+
+- **Isolated HOME** — every spawn gets its own temp dir under
+  `/tmp/paperclip-acp-sandbox-<uuid>/`. `$HOME` inside the child points
+  at `<sandbox>/HOME`, not the operator's real home directory.
+- **Minimal `~/.claude/settings.json`** — the sandbox writes exactly
+  `{"hooks":{}}` into the isolated HOME. The operator's PostToolUse,
+  Stop, and other hooks cannot fire inside the spawned agent and
+  therefore cannot inject `[Task Active]`-style marker text into its
+  stdout.
+- **Env allowlist + denylist** — the child env starts from `{}`. Only
+  `HOME`, `PATH`, `LANG`, `LC_ALL`, `TERM`, and `ANTHROPIC_API_KEY` pass
+  through. Anything matching `*TOKEN*`, `*SECRET*`, `*KEY*`,
+  `CLAUDE_*`, `PAPERCLIP_*`, `OPENAI_*`, `SESSION_*`, `MCP_*`, or
+  `KAIROS_*` is stripped. `ANTHROPIC_API_KEY` is the one explicit
+  exception to the `*KEY*` pattern (required for `claude -p`).
+- **Pinned PATH** — `/usr/bin:/bin:/usr/local/bin:<claude-bin-dir>`.
+  The parent's PATH (which may include the operator's project bins,
+  homebrew, etc.) does not leak through.
+- **Cleanup on success / preservation on failure** — sandbox dirs are
+  deleted when the agent exits with code 0 and preserved on non-zero
+  exits so the operator can inspect what the child saw. A TTL sweeper
+  removes any sandbox older than 24h on plugin startup and on each
+  reaper tick (path-traversal-guarded — only directories under
+  `/tmp/paperclip-acp-sandbox-` are eligible).
+
+Source-of-truth reference: this is a TypeScript port of the kairos
+`daemon/sandbox.py` design that closed the chat-bleed property class
+identified in commit `dc9884a`. See `src/sandbox.ts` for the
+implementation and `tests/sandbox.test.ts` for the unit-test contract.
+
 ## How it works
 
 ```
 Chat message (Telegram/Discord/Slack)
     -> Chat plugin emits acp:spawn / acp:message event
     -> ACP plugin routes to bound session
-    -> Coding agent subprocess (stdio)
+    -> Coding agent subprocess (stdio, isolated HOME, scrubbed env)
     -> Agent output emitted as acp:output event
     -> Chat plugin sends response to thread
 ```
