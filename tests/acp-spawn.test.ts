@@ -501,3 +501,137 @@ describe("getActiveSessionIds", () => {
     expect(ids).toHaveLength(3);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Spec 167 — Sandbox wiring integration tests
+// ---------------------------------------------------------------------------
+
+describe("spawnAgent — sandbox isolation (spec 167)", () => {
+  let ctx: ReturnType<typeof createMockContext>;
+  let originalEnv: NodeJS.ProcessEnv;
+
+  beforeEach(() => {
+    ctx = createMockContext();
+    vi.clearAllMocks();
+    mockUpdateSession.mockResolvedValue(undefined);
+    for (const id of getActiveSessionIds()) {
+      killSession(id);
+    }
+    originalEnv = { ...process.env };
+  });
+
+  function restoreEnv() {
+    for (const k of Object.keys(process.env)) delete process.env[k];
+    Object.assign(process.env, originalEnv);
+  }
+
+  it("spawn() receives env from the sandbox, NOT a spread of process.env", async () => {
+    // Pre-seed parent env with denylist keys that MUST NOT leak through.
+    process.env.PAPERCLIP_AGENT_ID = "leaked";
+    process.env.CLAUDE_AGENT_ID = "leaked";
+    process.env.KAIROS_SPAWNED = "1";
+    process.env.OPENAI_API_KEY = "sk-leaked";
+
+    const child = createFakeChild();
+    mockGetAgent.mockReturnValue(makeAgent("claude"));
+    mockSpawn.mockReturnValue(child);
+    const session = makeSession({ sessionId: "s-env-scrub" });
+
+    await spawnAgent(ctx, session, () => {});
+
+    expect(mockSpawn).toHaveBeenCalled();
+    const spawnEnv = mockSpawn.mock.calls[0][2].env as Record<string, string>;
+    expect(spawnEnv.PAPERCLIP_AGENT_ID).toBeUndefined();
+    expect(spawnEnv.CLAUDE_AGENT_ID).toBeUndefined();
+    expect(spawnEnv.KAIROS_SPAWNED).toBeUndefined();
+    expect(spawnEnv.OPENAI_API_KEY).toBeUndefined();
+    // The TERM:"dumb" override still wins (set after sandbox env spread).
+    expect(spawnEnv.TERM).toBe("dumb");
+    // HOME points at a sandbox dir, not the operator home.
+    expect(spawnEnv.HOME).toContain("paperclip-acp-sandbox-");
+
+    restoreEnv();
+  });
+
+  it("preserves ANTHROPIC_API_KEY through the spawn env (allowlist exception)", async () => {
+    process.env.ANTHROPIC_API_KEY = "sk-ant-test";
+
+    const child = createFakeChild();
+    mockGetAgent.mockReturnValue(makeAgent("claude"));
+    mockSpawn.mockReturnValue(child);
+    const session = makeSession({ sessionId: "s-anthropic-key" });
+
+    await spawnAgent(ctx, session, () => {});
+
+    const spawnEnv = mockSpawn.mock.calls[0][2].env as Record<string, string>;
+    expect(spawnEnv.ANTHROPIC_API_KEY).toBe("sk-ant-test");
+
+    restoreEnv();
+  });
+
+  it("persists sandboxPath to session state via updateSession", async () => {
+    const child = createFakeChild();
+    mockGetAgent.mockReturnValue(makeAgent("claude"));
+    mockSpawn.mockReturnValue(child);
+    const session = makeSession({ sessionId: "s-sandbox-path" });
+
+    await spawnAgent(ctx, session, () => {});
+
+    // Find the updateSession call that set sandboxPath.
+    const sandboxPathCalls = mockUpdateSession.mock.calls.filter(
+      (call: unknown[]) =>
+        typeof (call[2] as Record<string, unknown>).sandboxPath === "string",
+    );
+    expect(sandboxPathCalls.length).toBeGreaterThanOrEqual(1);
+    const sbPath = (sandboxPathCalls[0][2] as Record<string, string>).sandboxPath;
+    expect(sbPath).toContain("paperclip-acp-sandbox-");
+  });
+
+  it("cleans up sandbox dir on exit code 0", async () => {
+    const child = createFakeChild();
+    mockGetAgent.mockReturnValue(makeAgent("claude"));
+    mockSpawn.mockReturnValue(child);
+    const session = makeSession({ sessionId: "s-cleanup-ok" });
+
+    await spawnAgent(ctx, session, () => {});
+    const sandboxPathCall = mockUpdateSession.mock.calls.find(
+      (call: unknown[]) =>
+        typeof (call[2] as Record<string, unknown>).sandboxPath === "string",
+    );
+    const sbPath = (sandboxPathCall![2] as Record<string, string>).sandboxPath;
+    const fs = await import("node:fs");
+    expect(fs.existsSync(sbPath)).toBe(true);
+
+    child.emit("close", 0);
+    await new Promise((r) => setTimeout(r, 30));
+
+    expect(fs.existsSync(sbPath)).toBe(false);
+  });
+
+  it("preserves sandbox dir on non-zero exit code (for post-mortem)", async () => {
+    const child = createFakeChild();
+    mockGetAgent.mockReturnValue(makeAgent("claude"));
+    mockSpawn.mockReturnValue(child);
+    const session = makeSession({ sessionId: "s-cleanup-fail" });
+
+    await spawnAgent(ctx, session, () => {});
+    const sandboxPathCall = mockUpdateSession.mock.calls.find(
+      (call: unknown[]) =>
+        typeof (call[2] as Record<string, unknown>).sandboxPath === "string",
+    );
+    const sbPath = (sandboxPathCall![2] as Record<string, string>).sandboxPath;
+    const fs = await import("node:fs");
+    const path = await import("node:path");
+
+    child.emit("close", 1);
+    await new Promise((r) => setTimeout(r, 30));
+
+    expect(fs.existsSync(sbPath)).toBe(true);
+    // settings.json should still be there for inspection.
+    expect(fs.existsSync(path.join(sbPath, "HOME", ".claude", "settings.json")))
+      .toBe(true);
+
+    // Test-only cleanup so we don't leak.
+    fs.rmSync(sbPath, { recursive: true, force: true });
+  });
+});

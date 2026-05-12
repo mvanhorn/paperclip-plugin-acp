@@ -32,6 +32,12 @@ export type AcpSession = {
   finalOutput?: string;
   /** Exit code captured when the child process terminates (oneshot only). */
   exitCode?: number | null;
+  /**
+   * Absolute path to the disposable sandbox dir created for this session's
+   * subprocess (host isolation, spec 167). Present only for sessions spawned
+   * by v0.6.0+; v0.5.0-era sessions read back without this field.
+   */
+  sandboxPath?: string;
 };
 
 export type AcpBinding = {

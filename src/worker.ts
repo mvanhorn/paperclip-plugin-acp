@@ -35,6 +35,7 @@ import {
   DEFAULT_CONFIG,
 } from "./constants.js";
 import { computeReapReason, reapSessionIfDue } from "./reaper.js";
+import { sweepExpiredSandboxes } from "./sandbox.js";
 import {
   createAttachment,
   listAttachments,
@@ -89,6 +90,18 @@ const plugin = definePlugin({
       peakHourEnabled: config.peakHourEnabled,
       sharedPoolSize: config.sharedPoolSize,
     });
+
+    // Spec 167: startup sweep of orphan sandboxes left behind by crashes or
+    // ungraceful restarts. Path-traversal-guarded; safe even if /tmp has
+    // unrelated content.
+    try {
+      const swept = sweepExpiredSandboxes(24);
+      ctx.logger.info("ACP startup sandbox sweep complete", { swept });
+    } catch (err) {
+      ctx.logger.warn("ACP startup sandbox sweep failed", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
 
     const enabledAgents = parseEnabledAgents(config?.enabledAgents ?? "claude,codex,gemini,opencode");
     if (enabledAgents.length === 0) {
@@ -516,8 +529,27 @@ const plugin = definePlugin({
     // This set gates that window within a single process.
     const reapingInFlight = new Set<string>();
 
+    // Spec 167: opportunistic orphan-sandbox sweep on each reaper tick,
+    // throttled so we sweep at most once per hour (a TTL of 24h doesn't need
+    // higher resolution than that, and readdirSync over /tmp is non-trivial).
+    let lastSweepAt = 0;
+    const SWEEP_THROTTLE_MS = 3_600_000;
+
     const reaperHandle = setInterval(async () => {
       const now = Date.now();
+      if (now - lastSweepAt >= SWEEP_THROTTLE_MS) {
+        lastSweepAt = now;
+        try {
+          const swept = sweepExpiredSandboxes(24);
+          if (swept > 0) {
+            ctx.logger.info("ACP reaper sandbox sweep removed orphans", { swept });
+          }
+        } catch (err) {
+          ctx.logger.warn("ACP reaper sandbox sweep failed", {
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
       const activeIds = getActiveSessionIds();
       for (const id of activeIds) {
         if (reapingInFlight.has(id)) continue;

@@ -9,6 +9,7 @@ import type {
 } from "./types.js";
 import { getAgent } from "./agents.js";
 import { DEFAULT_CONFIG } from "./constants.js";
+import { cleanupSandbox } from "./sandbox.js";
 
 const STATE_PREFIX = "acp-session:";
 const SESSIONS_PREFIX = "acp_sessions_";
@@ -98,6 +99,22 @@ export async function closeSession(
       session.binding.threadId,
       sessionId,
     );
+  }
+
+  // Spec 167: second cleanup path for reaper-driven closes. cleanupSandbox is
+  // idempotent (rmSync force:true, errors swallowed) so this is safe even if
+  // the acp-spawn child.close handler already deleted the dir. Sessions
+  // created before v0.6.0 have no sandboxPath; skip them.
+  if (session.sandboxPath) {
+    try {
+      cleanupSandbox(session.sandboxPath, true);
+    } catch (err) {
+      ctx.logger.warn("sandbox cleanup failed in closeSession", {
+        sessionId,
+        sandboxPath: session.sandboxPath,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
 }
 

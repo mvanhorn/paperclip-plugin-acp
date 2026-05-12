@@ -4,6 +4,7 @@ import { getAgent } from "./agents.js";
 import { updateSession } from "./session-manager.js";
 import type { AcpSession, AcpOutputEvent } from "./types.js";
 import { METRIC_NAMES } from "./constants.js";
+import { buildSandboxProfile, cleanupSandbox } from "./sandbox.js";
 
 const activeProcesses = new Map<string, ChildProcess>();
 
@@ -38,11 +39,34 @@ export async function spawnAgent(
     oneshot: isOneshot,
   });
 
+  // Build a disposable sandbox profile per session (spec 167). The sandbox
+  // gives the subprocess an isolated $HOME with an empty hooks settings.json
+  // and a scrubbed env (denylist for CLAUDE_*/PAPERCLIP_*/KAIROS_*/OPENAI_*/
+  // *TOKEN*/*SECRET*/*KEY* with ANTHROPIC_API_KEY exempted). Failure to
+  // build the sandbox is fatal — we MUST NOT fall back to spreading the
+  // parent process env into the child.
+  let sandbox;
+  try {
+    sandbox = buildSandboxProfile(session.sessionId);
+  } catch (err) {
+    await updateSession(ctx, session.sessionId, { state: "error" });
+    await ctx.metrics.write(METRIC_NAMES.spawnErrors, 1);
+    onOutput({
+      sessionId: session.sessionId,
+      type: "error",
+      error: `Sandbox build failed: ${err instanceof Error ? err.message : String(err)}`,
+    });
+    return;
+  }
+  await updateSession(ctx, session.sessionId, {
+    sandboxPath: sandbox.sandboxRoot,
+  });
+
   try {
     const child = spawn(agent.command, spawnArgs, {
       cwd: session.cwd,
       stdio: ["pipe", "pipe", "pipe"],
-      env: { ...process.env, TERM: "dumb" },
+      env: { ...sandbox.env, TERM: "dumb" },
     });
 
     activeProcesses.set(session.sessionId, child);
@@ -116,6 +140,19 @@ export async function spawnAgent(
       } else {
         await ctx.metrics.write(METRIC_NAMES.spawnErrors, 1);
       }
+
+      // Spec 167: delete sandbox on success; preserve on non-zero exit for
+      // post-mortem. cleanupSandbox is idempotent — safe to also be called
+      // from session-manager.closeSession on a reaper-driven close.
+      try {
+        cleanupSandbox(sandbox.sandboxRoot, code === 0);
+      } catch (err) {
+        ctx.logger.warn("sandbox cleanup failed", {
+          sessionId: session.sessionId,
+          sandboxRoot: sandbox.sandboxRoot,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
     });
 
     child.on("error", async (err: Error) => {
@@ -128,6 +165,14 @@ export async function spawnAgent(
         type: "error",
         error: `Failed to spawn ${agent.displayName}: ${err.message}`,
       });
+
+      // Spawn failure — preserve sandbox so the operator can inspect what
+      // the child would have seen (settings.json, env_dump if added later).
+      try {
+        cleanupSandbox(sandbox.sandboxRoot, false);
+      } catch {
+        /* ignore */
+      }
     });
 
     // In one-shot mode, deliver the prompt via stdin and close stdin so the
