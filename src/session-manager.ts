@@ -27,13 +27,14 @@ export function generateSessionId(): string {
 export async function createSession(
   ctx: PluginContext,
   params: {
+    sessionId?: string;
     agentId: AcpAgentId;
     mode: AcpSessionMode;
     cwd: string;
     binding?: AcpBinding;
   },
 ): Promise<AcpSession> {
-  const sessionId = generateSessionId();
+  const sessionId = params.sessionId ?? generateSessionId();
   const now = Date.now();
 
   const session: AcpSession = {

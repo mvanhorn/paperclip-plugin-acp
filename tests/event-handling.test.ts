@@ -22,6 +22,10 @@ describe("cross-plugin event name generation", () => {
       "plugin.paperclip-plugin-discord.acp-message",
       "plugin.paperclip-plugin-discord.acp-cancel",
       "plugin.paperclip-plugin-discord.acp-close",
+      "plugin.paperclip-plugin-line.acp-spawn",
+      "plugin.paperclip-plugin-line.acp-message",
+      "plugin.paperclip-plugin-line.acp-cancel",
+      "plugin.paperclip-plugin-line.acp-close",
     ];
 
     const generated: string[] = [];
@@ -34,11 +38,12 @@ describe("cross-plugin event name generation", () => {
     expect(generated).toEqual(expected);
   });
 
-  it("lists all 3 chat platform plugins", () => {
-    expect(CHAT_PLATFORM_PLUGINS).toHaveLength(3);
+  it("lists all chat platform plugins", () => {
+    expect(CHAT_PLATFORM_PLUGINS).toHaveLength(4);
     expect(CHAT_PLATFORM_PLUGINS).toContain("paperclip-plugin-telegram");
     expect(CHAT_PLATFORM_PLUGINS).toContain("paperclip-plugin-slack");
     expect(CHAT_PLATFORM_PLUGINS).toContain("paperclip-plugin-discord");
+    expect(CHAT_PLATFORM_PLUGINS).toContain("paperclip-plugin-line");
   });
 
   it("lists all 4 inbound event suffixes", () => {
