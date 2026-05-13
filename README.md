@@ -49,13 +49,14 @@ Chat plugins communicate with the ACP plugin via namespaced events on Paperclip'
 plugin.paperclip-plugin-telegram.acp-spawn
 plugin.paperclip-plugin-slack.acp-message
 plugin.paperclip-plugin-discord.acp-close
+plugin.paperclip-plugin-line.acp-spawn
 ```
 
 **Inbound events (chat plugin -> ACP)**
 
 | Event suffix | Payload | Description |
 |-------------|---------|-------------|
-| `acp-spawn` | `{ agentName, chatId, threadId, companyId, cwd?, mode? }` | Spawn an agent session bound to a thread |
+| `acp-spawn` | `{ sessionId?, agentName, chatId, threadId, companyId, cwd?, mode? }` | Spawn an agent session bound to a thread. If `sessionId` is supplied, ACP uses it so chat bridges can route follow-up messages and output deterministically. |
 | `acp-message` | `{ sessionId, text }` | Send a prompt to a running session |
 | `acp-cancel` | `{ sessionId }` | SIGINT the current turn |
 | `acp-close` | `{ sessionId }` | SIGTERM and remove the session |
@@ -66,7 +67,7 @@ plugin.paperclip-plugin-discord.acp-close
 |-------|---------|-------------|
 | `output` | `{ sessionId, type, text?, error?, chatId, threadId }` | Agent output routed back to the originating thread |
 
-The ACP plugin registers listeners for all three platforms (Telegram, Slack, Discord) on startup. Adding a new platform requires adding its plugin ID to `CHAT_PLATFORM_PLUGINS` in `constants.ts`.
+The ACP plugin registers listeners for Telegram, Slack, Discord, and LINE on startup. Adding a new platform requires adding its plugin ID to `CHAT_PLATFORM_PLUGINS` in `constants.ts`.
 
 ### Lazy migration from 1:1 format
 Existing threads that used the old 1:1 binding format (`acp_{chatId}_{threadId}` key) are migrated automatically on first access. The old key is read, converted to a single-entry sessions array under the new `acp_sessions_{chatId}_{threadId}` key, and the old key is deleted. No manual migration needed.

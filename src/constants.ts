@@ -32,6 +32,7 @@ export const CHAT_PLATFORM_PLUGINS = [
   "paperclip-plugin-telegram",
   "paperclip-plugin-slack",
   "paperclip-plugin-discord",
+  "paperclip-plugin-line",
 ] as const;
 
 /** Event names emitted by chat plugins that the ACP plugin listens to */

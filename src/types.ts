@@ -93,6 +93,7 @@ export type AcpMessageEvent = {
 
 /** Cross-plugin event payloads */
 export type AcpSpawnEvent = {
+  sessionId?: string;
   agentName: AcpAgentId;
   chatId: string;
   threadId: string;
