@@ -86,6 +86,10 @@ curl -X POST http://127.0.0.1:3100/api/plugins/install \
   -d '{"packageName":"paperclip-plugin-acp"}'
 ```
 
+## Troubleshooting: confirm your Paperclip host
+
+If spawns or sessions fail, first confirm which Paperclip host this plugin is registered against. Run `paperclipai plugin target` ([#8575](https://github.com/paperclipai/paperclip/pull/8575)) — it prints the resolved API URL plus the server's status, version, deploymentMode, and deploymentExposure *before* anything is installed. A server version older than this plugin expects is the most common cause of activation and session-spawn errors that look like plugin bugs but aren't. If the URL or version is wrong, point Paperclip at the right host — or update the server — before opening an issue.
+
 ## Configuration
 
 | Setting | Default | Description |
