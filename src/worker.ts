@@ -675,7 +675,13 @@ async function handleSpawn(
     boundAt: Date.now(),
   };
 
-  const session = await createSession(ctx, { agentId, mode, cwd, binding });
+  const session = await createSession(ctx, {
+    sessionId: event.sessionId,
+    agentId,
+    mode,
+    cwd,
+    binding,
+  });
 
   // Build the thread session entry
   const entry: AcpSessionEntry = {

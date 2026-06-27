@@ -73,6 +73,7 @@ describe("type exports compile correctly", () => {
   });
 
   it("cross-plugin event payloads have expected shapes", () => {
+    expectTypeOf<AcpSpawnEvent>().toHaveProperty("sessionId");
     expectTypeOf<AcpSpawnEvent>().toHaveProperty("agentName");
     expectTypeOf<AcpSpawnEvent>().toHaveProperty("chatId");
     expectTypeOf<AcpSpawnEvent>().toHaveProperty("threadId");

@@ -59,6 +59,18 @@ describe("per-session CRUD (createSession / getSession / updateSession / closeSe
     expect(retrieved).toEqual(session);
   });
 
+  it("createSession honors a caller-supplied session id for cross-plugin chat bridges", async () => {
+    const session = await createSession(ctx, {
+      sessionId: "line-session-1",
+      agentId: "claude",
+      mode: "persistent",
+      cwd: "/workspace",
+    });
+
+    expect(session.sessionId).toBe("line-session-1");
+    await expect(getSession(ctx, "line-session-1")).resolves.toEqual(session);
+  });
+
   it("getSession returns null for unknown sessionId", async () => {
     const result = await getSession(ctx, "nonexistent");
     expect(result).toBeNull();

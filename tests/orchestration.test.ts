@@ -107,7 +107,7 @@ describe("Session cap enforcement", () => {
   it("should allow spawn when in_progress count is below shared pool size", async () => {
     mockFetchInProgress(10); // 10 < 18
     const ctx = createMockContext();
-    const config = makeConfig();
+    const config = makeConfig({ peakHourEnabled: false });
     const event = makeEvent();
 
     const result = await checkSpawnGuards(ctx, config, event);
@@ -117,7 +117,7 @@ describe("Session cap enforcement", () => {
   it("should reject spawn when in_progress count equals shared pool size", async () => {
     mockFetchInProgress(18); // 18 == 18
     const ctx = createMockContext();
-    const config = makeConfig();
+    const config = makeConfig({ peakHourEnabled: false });
     const event = makeEvent();
 
     const result = await checkSpawnGuards(ctx, config, event);
@@ -129,7 +129,7 @@ describe("Session cap enforcement", () => {
   it("should reject spawn when in_progress count exceeds shared pool size", async () => {
     mockFetchInProgress(25); // 25 > 18
     const ctx = createMockContext();
-    const config = makeConfig();
+    const config = makeConfig({ peakHourEnabled: false });
     const event = makeEvent();
 
     const result = await checkSpawnGuards(ctx, config, event);
