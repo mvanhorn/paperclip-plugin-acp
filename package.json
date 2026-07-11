@@ -27,7 +27,7 @@
     "@types/node": "^25.5.0",
     "@types/pg": "^8.15.0",
     "typescript": "^5.7.0",
-    "vitest": "^3.0.0"
+    "vitest": "^3.2.6"
   },
   "files": [
     "dist/"
