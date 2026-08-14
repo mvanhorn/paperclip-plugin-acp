@@ -304,6 +304,241 @@ describe("spawnAgent", () => {
     expect(events[0].toolInput).toBe(JSON.stringify({ path: "/tmp/x" }));
   });
 
+  it("parses ACP-shaped agent_message_chunk text messages", async () => {
+    const child = createFakeChild();
+    mockGetAgent.mockReturnValue(makeAgent("gemini"));
+    mockSpawn.mockReturnValue(child);
+    const session = makeSession({ sessionId: "s-acp-text" });
+    const events: AcpOutputEvent[] = [];
+
+    await spawnAgent(ctx, session, (e) => events.push(e));
+
+    child.stdout.emit(
+      "data",
+      Buffer.from(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: {
+            sessionId: "s-acp-text",
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: "Hello" },
+            },
+          },
+        }) + "\n",
+      ),
+    );
+
+    expect(events).toEqual([
+      { sessionId: "s-acp-text", type: "text", text: "Hello" },
+    ]);
+    expect(
+      ctx.metrics._writes.filter(
+        (w: { name: string }) => w.name === METRIC_NAMES.outputsReceived,
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("parses ACP-shaped tool_call messages and preserves structured input", async () => {
+    const child = createFakeChild();
+    mockGetAgent.mockReturnValue(makeAgent("gemini"));
+    mockSpawn.mockReturnValue(child);
+    const session = makeSession({ sessionId: "s-acp-toolcall" });
+    const events: AcpOutputEvent[] = [];
+
+    await spawnAgent(ctx, session, (e) => events.push(e));
+
+    child.stdout.emit(
+      "data",
+      Buffer.from(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: {
+            sessionId: "s-acp-toolcall",
+            update: {
+              sessionUpdate: "tool_call",
+              toolCallId: "call-1",
+              title: "Read file",
+              kind: "read",
+              status: "in_progress",
+              rawInput: { path: "/tmp/x", line: 1 },
+            },
+          },
+        }) + "\n",
+      ),
+    );
+
+    expect(events).toEqual([
+      {
+        sessionId: "s-acp-toolcall",
+        type: "tool_call",
+        toolName: "Read file",
+        toolInput: JSON.stringify({ path: "/tmp/x", line: 1 }),
+      },
+    ]);
+  });
+
+  it("parses ACP-shaped tool_call_update output", async () => {
+    const child = createFakeChild();
+    mockGetAgent.mockReturnValue(makeAgent("gemini"));
+    mockSpawn.mockReturnValue(child);
+    const session = makeSession({ sessionId: "s-acp-toolresult" });
+    const events: AcpOutputEvent[] = [];
+
+    await spawnAgent(ctx, session, (e) => events.push(e));
+
+    child.stdout.emit(
+      "data",
+      Buffer.from(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: {
+            sessionId: "s-acp-toolresult",
+            update: {
+              sessionUpdate: "tool_call_update",
+              toolCallId: "call-1",
+              name: "read_file",
+              status: "completed",
+              rawOutput: { content: "file contents" },
+            },
+          },
+        }) + "\n",
+      ),
+    );
+
+    expect(events).toEqual([
+      {
+        sessionId: "s-acp-toolresult",
+        type: "tool_result",
+        toolName: "read_file",
+        toolOutput: JSON.stringify({ content: "file contents" }),
+      },
+    ]);
+  });
+
+  it("ignores progress-only ACP tool_call_update messages", async () => {
+    const child = createFakeChild();
+    mockGetAgent.mockReturnValue(makeAgent("gemini"));
+    mockSpawn.mockReturnValue(child);
+    const session = makeSession({ sessionId: "s-acp-tool-progress" });
+    const events: AcpOutputEvent[] = [];
+
+    await spawnAgent(ctx, session, (e) => events.push(e));
+
+    child.stdout.emit(
+      "data",
+      Buffer.from(
+        JSON.stringify({
+          method: "session/update",
+          params: {
+            sessionId: "s-acp-tool-progress",
+            update: {
+              sessionUpdate: "tool_call_update",
+              toolCallId: "call-1",
+              status: "in_progress",
+            },
+          },
+        }) + "\n",
+      ),
+    );
+
+    expect(events).toHaveLength(0);
+  });
+
+  it("ignores unsupported ACP structured updates", async () => {
+    const child = createFakeChild();
+    mockGetAgent.mockReturnValue(makeAgent("gemini"));
+    mockSpawn.mockReturnValue(child);
+    const session = makeSession({ sessionId: "s-acp-plan" });
+    const events: AcpOutputEvent[] = [];
+
+    await spawnAgent(ctx, session, (e) => events.push(e));
+
+    child.stdout.emit(
+      "data",
+      Buffer.from(
+        JSON.stringify({
+          method: "session/update",
+          params: {
+            sessionId: "s-acp-plan",
+            update: {
+              sessionUpdate: "plan",
+              entries: [
+                {
+                  content: "Inspect the repository",
+                  priority: "high",
+                  status: "pending",
+                },
+              ],
+            },
+          },
+        }) + "\n",
+      ),
+    );
+
+    expect(events).toHaveLength(0);
+  });
+
+  it("does not expose ACP agent_thought_chunk as text", async () => {
+    const child = createFakeChild();
+    mockGetAgent.mockReturnValue(makeAgent("gemini"));
+    mockSpawn.mockReturnValue(child);
+    const session = makeSession({ sessionId: "s-acp-thought" });
+    const events: AcpOutputEvent[] = [];
+
+    await spawnAgent(ctx, session, (e) => events.push(e));
+
+    child.stdout.emit(
+      "data",
+      Buffer.from(
+        JSON.stringify({
+          method: "session/update",
+          params: {
+            sessionId: "s-acp-thought",
+            update: {
+              sessionUpdate: "agent_thought_chunk",
+              content: { type: "text", text: "private reasoning" },
+            },
+          },
+        }) + "\n",
+      ),
+    );
+
+    expect(events).toHaveLength(0);
+  });
+
+  it("preserves legacy flat tool_result messages", async () => {
+    const child = createFakeChild();
+    mockGetAgent.mockReturnValue(makeAgent("claude"));
+    mockSpawn.mockReturnValue(child);
+    const session = makeSession({ sessionId: "s-legacy-toolresult" });
+    const events: AcpOutputEvent[] = [];
+
+    await spawnAgent(ctx, session, (e) => events.push(e));
+
+    child.stdout.emit(
+      "data",
+      Buffer.from(
+        JSON.stringify({
+          method: "session/update",
+          params: { type: "tool_result", name: "read_file", output: "contents" },
+        }) + "\n",
+      ),
+    );
+
+    expect(events).toEqual([
+      {
+        sessionId: "s-legacy-toolresult",
+        type: "tool_result",
+        toolName: "read_file",
+        toolOutput: "contents",
+      },
+    ]);
+  });
+
   it("emits plain text for non-JSON stdout lines", async () => {
     const child = createFakeChild();
     mockGetAgent.mockReturnValue(makeAgent("claude"));
