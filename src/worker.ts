@@ -175,11 +175,8 @@ async function bootstrapFromInvocation(
   }
 }
 
-/** Page size for enumerating companies. */
-const COMPANY_PAGE_SIZE = 100;
-
 /**
- * Hard ceiling on companies enumerated for ownership selection. Past this the
+ * Hard ceiling on companies considered for ownership selection. Past this the
  * walk gives up selecting an owner entirely rather than guessing from a partial
  * set — the host still delivers configuration through `onConfigChanged`.
  */
@@ -196,49 +193,51 @@ const MAX_WALK_COMPANIES = 1000;
 const MAX_WALK_PROBES = 25;
 
 /**
- * Enumerate the COMPLETE set of company ids visible to the plugin.
+ * Enumerate the COMPLETE set of company ids visible to the plugin, in one
+ * request.
  *
- * Returns null when the set cannot be established — a listing error or a tenant
- * count past the ceiling. A partial set is never returned: ownership must not be
+ * Returns null when the set cannot be established — a listing error, or more
+ * rows than the ceiling. A partial set is never returned: ownership must not be
  * chosen from an arbitrary subset (see `runStartupConfigWalk`).
+ *
+ * Deliberately NOT paginated. The host answers every `companies.list` call by
+ * re-running an unordered query and slicing the fresh result
+ * (`applyWindow(await companies.list(), params)`, over a query with no
+ * `ORDER BY`), so two calls can order the rows differently: consecutive offset
+ * windows may overlap, silently omit a company, and still end in a short page
+ * that looks like the end of the data. Offset paging therefore cannot prove
+ * completeness on this API. One request bounded at `MAX_WALK_COMPANIES + 1`
+ * can: a full-size response means the ceiling was exceeded, and anything
+ * smaller is the whole set as of that single query.
  */
 async function listAllCompanyIds(ctx: PluginContext): Promise<string[] | null> {
-  const ids = new Set<string>();
-
-  for (let offset = 0; ; offset += COMPANY_PAGE_SIZE) {
-    let page: Array<{ id: string }>;
-    try {
-      page = (await ctx.companies.list({
-        limit: COMPANY_PAGE_SIZE,
-        offset,
-      })) as Array<{ id: string }>;
-    } catch (err) {
-      // Recorded apart from config errors: a denied listing is not the host
-      // refusing our configuration, and must not degrade health.
-      const message = recordCompanyListingError(err);
-      ctx.logger.info("Startup config walk could not list companies", { offset, error: message });
-      return null;
-    }
-
-    for (const company of page) {
-      if (typeof company?.id === "string" && company.id.length > 0) ids.add(company.id);
-    }
-
-    // A short page ends the enumeration. A page larger than we asked for means
-    // the host ignored the window and returned everything, which is also the
-    // complete set.
-    if (page.length < COMPANY_PAGE_SIZE || page.length > COMPANY_PAGE_SIZE) break;
-
-    if (ids.size > MAX_WALK_COMPANIES) {
-      ctx.logger.warn(
-        "Too many companies to establish a startup configuration owner — skipping the walk; " +
-          "the runtime starts when the host delivers configuration",
-        { companiesSeen: ids.size, maxCompanies: MAX_WALK_COMPANIES },
-      );
-      return null;
-    }
+  let rows: Array<{ id: string }>;
+  try {
+    rows = (await ctx.companies.list({
+      limit: MAX_WALK_COMPANIES + 1,
+      offset: 0,
+    })) as Array<{ id: string }>;
+  } catch (err) {
+    // Recorded apart from config errors: a denied listing is not the host
+    // refusing our configuration, and must not degrade health.
+    const message = recordCompanyListingError(err);
+    ctx.logger.info("Startup config walk could not list companies", { error: message });
+    return null;
   }
 
+  if (rows.length > MAX_WALK_COMPANIES) {
+    ctx.logger.warn(
+      "Too many companies to establish a startup configuration owner — skipping the walk; " +
+        "the runtime starts when the host delivers configuration",
+      { companiesSeen: rows.length, maxCompanies: MAX_WALK_COMPANIES },
+    );
+    return null;
+  }
+
+  const ids = new Set<string>();
+  for (const company of rows) {
+    if (typeof company?.id === "string" && company.id.length > 0) ids.add(company.id);
+  }
   return [...ids];
 }
 
@@ -254,13 +253,14 @@ async function listAllCompanyIds(ctx: PluginContext): Promise<string[] | null> {
  * before they reached the hook while the saves that did arrive would be ignored
  * as a second company's — the runtime would then be unreachable from both sides.
  *
- * `companies.list()` has no ordering contract and is paginated by the caller, so
- * neither the host's page order nor any single page can establish that owner:
- * the globally lowest configured company can sit in any page. The walk therefore
- * enumerates every company first, sorts the complete set by id in byte order
- * (matching the host's sort — not `localeCompare`, whose collation would
- * diverge), and only then probes for a readable config. If the complete set
- * cannot be established, no owner is chosen at all.
+ * `companies.list()` has no ordering contract, so no page of it can establish
+ * that owner — the globally lowest configured company can sit anywhere, and the
+ * host re-queries unordered on every call, which makes offset paging unable to
+ * prove it saw everything. The walk therefore takes ONE bounded snapshot of the
+ * whole company set, sorts it by id in byte order (matching the host's sort —
+ * not `localeCompare`, whose collation would diverge), and only then probes for
+ * a readable config. If the complete set cannot be established, no owner is
+ * chosen at all.
  *
  * On hosts >= v2026.817.0 the host seeds proactive company scopes from stored
  * config rows, so this succeeds at worker boot. On v2026.720.0 / v2026.722.0
