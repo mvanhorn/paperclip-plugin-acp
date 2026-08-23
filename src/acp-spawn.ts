@@ -208,31 +208,75 @@ function handleAgentMessage(
   const method = msg.method as string | undefined;
 
   if (method === "session/update") {
-    const params = msg.params as Record<string, unknown> | undefined;
-    if (!params) return;
+    const params = msg.params;
+    if (!isRecord(params)) return;
 
-    const updateType = params.type as string | undefined;
+    const update = params.update;
+    if (isRecord(update)) {
+      const updateType = update.sessionUpdate;
 
-    if (updateType === "text") {
-      onOutput({
-        sessionId,
-        type: "text",
-        text: params.text as string,
-      });
-    } else if (updateType === "tool_call") {
-      onOutput({
-        sessionId,
-        type: "tool_call",
-        toolName: params.name as string,
-        toolInput: JSON.stringify(params.input),
-      });
-    } else if (updateType === "tool_result") {
-      onOutput({
-        sessionId,
-        type: "tool_result",
-        toolName: params.name as string,
-        toolOutput: params.output as string,
-      });
+      if (
+        updateType === "agent_message_chunk" &&
+        isRecord(update.content) &&
+        update.content.type === "text" &&
+        typeof update.content.text === "string"
+      ) {
+        onOutput({
+          sessionId,
+          type: "text",
+          text: update.content.text,
+        });
+      } else if (updateType === "tool_call") {
+        onOutput({
+          sessionId,
+          type: "tool_call",
+          toolName: getToolName(update),
+          toolInput: serializeAcpValue(update.rawInput),
+        });
+      } else if (updateType === "tool_call_update") {
+        const hasRawOutput =
+          Object.prototype.hasOwnProperty.call(update, "rawOutput") &&
+          update.rawOutput !== undefined;
+        const hasContent = Array.isArray(update.content) && update.content.length > 0;
+
+        if (hasRawOutput || hasContent) {
+          const toolOutput = hasRawOutput
+            ? serializeAcpValue(update.rawOutput)
+            : JSON.stringify(update.content);
+          if (toolOutput !== undefined) {
+            onOutput({
+              sessionId,
+              type: "tool_result",
+              toolName: getToolName(update),
+              toolOutput,
+            });
+          }
+        }
+      }
+    } else {
+      const updateType = params.type as string | undefined;
+
+      if (updateType === "text") {
+        onOutput({
+          sessionId,
+          type: "text",
+          text: params.text as string,
+        });
+      } else if (updateType === "tool_call") {
+        onOutput({
+          sessionId,
+          type: "tool_call",
+          toolName: params.name as string,
+          toolInput: JSON.stringify(params.input),
+        });
+      } else if (updateType === "tool_result") {
+        onOutput({
+          sessionId,
+          type: "tool_result",
+          toolName: params.name as string,
+          toolOutput: params.output as string,
+        });
+      }
     }
 
     ctx.metrics.write(METRIC_NAMES.outputsReceived, 1).catch(() => {});
@@ -247,4 +291,20 @@ function handleAgentMessage(
       text: JSON.stringify(msg.result ?? msg.content),
     });
   }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function getToolName(update: Record<string, unknown>): string | undefined {
+  if (typeof update.name === "string") return update.name;
+  if (typeof update.title === "string") return update.title;
+  return undefined;
+}
+
+function serializeAcpValue(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value === "string") return value;
+  return JSON.stringify(value);
 }
