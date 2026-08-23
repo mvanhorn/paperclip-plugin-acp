@@ -102,6 +102,36 @@ If spawns or sessions fail, first confirm which Paperclip host this plugin is re
 | `sessionMaxAgeMs` | `28800000` | Close sessions after 8 hours |
 | `maxSessionsPerThread` | `5` | Max concurrent sessions per chat thread |
 
+### Host compatibility and config delivery
+
+Paperclip **v2026.720.0** and newer require a company scope for every plugin
+configuration read ([paperclipai/paperclip#9557](https://github.com/paperclipai/paperclip/pull/9557)).
+A plugin worker starts outside any company invocation, so it cannot read its own
+configuration at startup on those hosts.
+
+This plugin is built for that: the worker always starts on its built-in
+defaults, registers its tools and event listeners, and adopts a company's
+configuration as soon as one becomes reachable — from the host's config
+delivery, from a startup walk over the companies it can see, or from the first
+company-scoped event or tool call. It never fails activation because a
+configuration is unavailable.
+
+| Paperclip version | Behaviour |
+|-------------------|-----------|
+| >= v2026.817.0 | The worker reads the stored configuration at boot for companies that already have one, and picks up later saves without a restart. |
+| v2026.720.0 - v2026.722.0 | Worker-initiated config reads are denied. The runtime picks up your settings when the host delivers them: **save the plugin configuration once after installing** and the worker adopts it in place, no restart needed. |
+| < v2026.720.0 | Unaffected; the worker runs on whatever configuration the host delivers. |
+
+Until a company configuration has been adopted, the plugin runs on the defaults
+in the table above — it is fully functional, just untuned. The plugin health
+panel shows where the active configuration came from (`configSource`) and, if
+the host refused a read, the exact host error.
+
+The plugin runs a **single company's configuration** per worker. The first
+company whose configuration resolves owns the runtime; a later save for that
+same company refreshes it. Serving several companies from one worker is a
+possible follow-up, not current behaviour.
+
 ## Agent tools
 
 The plugin exposes these tools to Paperclip agents:
@@ -134,7 +164,7 @@ pnpm test
 pnpm build
 ```
 
-~50 tests covering session lifecycle, spawn/send/cancel/close flows, 1:N session support, idle timeout, max age, lazy migration, cross-plugin event routing, and error handling.
+241 tests covering session lifecycle, spawn/send/cancel/close flows, 1:N session support, idle timeout, max age, lazy migration, cross-plugin event routing, orchestration guards, webhook hooks, attachments, the company-scoped config host matrix, and error handling.
 
 ## Contributing
 
