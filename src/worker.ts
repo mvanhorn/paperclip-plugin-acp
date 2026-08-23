@@ -54,9 +54,11 @@ import type {
 import {
   applyCompanyConfig,
   getConfig,
+  getConfigSequence,
   getRuntimeConfigState,
   isBootstrapped,
   recordBootstrapError,
+  recordCompanyListingError,
   type ConfigSource,
 } from "./runtime-config.js";
 import {
@@ -90,20 +92,48 @@ function currentEnabledAgents(): ReturnType<typeof parseEnabledAgents> {
 function adoptConfig(
   ctx: PluginContext,
   raw: unknown,
-  opts: { companyId: string | null; source: ConfigSource },
+  opts: {
+    companyId: string | null;
+    source: ConfigSource;
+    /** Sequence captured before an awaited host read; see `applyCompanyConfig`. */
+    expectedSequence?: number;
+  },
 ): boolean {
   const result = applyCompanyConfig(raw, opts);
 
   if (!result.applied) {
+    if (result.skippedReason === "stale-snapshot") {
+      // A newer configuration landed while our read was in flight. Dropping the
+      // older snapshot keeps the most recent save authoritative.
+      ctx.logger.info("Discarding a configuration read that resolved after a newer save", {
+        companyId: opts.companyId,
+        source: opts.source,
+      });
+    } else {
+      ctx.logger.warn(
+        "Ignoring config for a second company — this plugin runs a single company runtime",
+        {
+          runningCompanyId: result.companyId,
+          ignoredCompanyId: opts.companyId,
+          source: opts.source,
+        },
+      );
+    }
+    return false;
+  }
+
+  if (result.legacyUnscopedReplace) {
+    // Hosts before v2026.817.0 call onConfigChanged with no company context, so
+    // a second company's save is indistinguishable from a refresh of the running
+    // one. Surface it rather than swapping the running company's settings mutely.
     ctx.logger.warn(
-      "Ignoring config for a second company — this plugin runs a single company runtime",
+      "Applied a configuration delivered without a company scope over a company-owned config — " +
+        "this host cannot identify the saving company, so it is treated as a single-tenant refresh",
       {
         runningCompanyId: result.companyId,
-        ignoredCompanyId: opts.companyId,
         source: opts.source,
       },
     );
-    return false;
   }
 
   const config = getConfig();
@@ -130,9 +160,12 @@ async function bootstrapFromInvocation(
   companyId: string | null | undefined,
 ): Promise<void> {
   if (!companyId || isBootstrapped()) return;
+  // Captured before the await: if a save lands while this read is in flight the
+  // sequence moves on and the stale snapshot is dropped rather than applied.
+  const expectedSequence = getConfigSequence();
   try {
     const raw = await ctx.config.get(companyId);
-    adoptConfig(ctx, raw, { companyId, source: "invocation" });
+    adoptConfig(ctx, raw, { companyId, source: "invocation", expectedSequence });
   } catch (err) {
     const message = recordBootstrapError(err);
     ctx.logger.debug("Company-scoped config read failed during invocation", {
@@ -143,8 +176,26 @@ async function bootstrapFromInvocation(
 }
 
 /**
+ * How many companies the startup walk will look at. The walk is a convenience,
+ * not a contract: the host delivers configuration through `onConfigChanged`
+ * regardless. `companies.list()` returns *every* company when no limit is given
+ * (`applyWindow` in the host's plugin-host-services), so an unbounded walk would
+ * make startup cost proportional to tenant count for no added value.
+ */
+const WALK_COMPANY_LIMIT = 25;
+
+/**
  * Best-effort startup walk: list the companies visible to the plugin and adopt
  * the configuration of the first one whose config row resolves.
+ *
+ * Companies are walked in ascending `companyId` order, deliberately matching
+ * the order the host replays stored configs in (`listConfigs` is
+ * `orderBy(asc(pluginConfig.companyId))` in the host's plugin-registry, and the
+ * SDK's own single-tenant guard binds to the first company it replays).
+ * `companies.list()` itself has no `ORDER BY`, so walking it in host-returned
+ * order could make this plugin own one company while the SDK owns another —
+ * after which the SDK rejects saves for our company before they ever reach the
+ * hook, and the saves that do reach it are ignored as a second company's.
  *
  * On hosts >= v2026.817.0 the host seeds proactive company scopes from stored
  * config rows, so this succeeds at worker boot. On v2026.720.0 / v2026.722.0
@@ -157,20 +208,40 @@ export async function runStartupConfigWalk(ctx: PluginContext): Promise<boolean>
 
   let companies: Array<{ id: string }> = [];
   try {
-    companies = (await ctx.companies.list()) as Array<{ id: string }>;
+    companies = (await ctx.companies.list({
+      limit: WALK_COMPANY_LIMIT,
+      offset: 0,
+    })) as Array<{ id: string }>;
   } catch (err) {
-    const message = recordBootstrapError(err);
+    // Recorded apart from config errors: a denied listing is not the host
+    // refusing our configuration, and must not degrade health.
+    const message = recordCompanyListingError(err);
     ctx.logger.info("Startup config walk could not list companies", { error: message });
     return false;
   }
 
-  for (const company of companies) {
-    if (!company?.id) continue;
+  // Byte-order comparison, matching the host's ascending companyId sort — not
+  // localeCompare, whose collation would diverge from it.
+  const ordered = [...companies]
+    .filter((company) => typeof company?.id === "string" && company.id.length > 0)
+    .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+    .slice(0, WALK_COMPANY_LIMIT);
+
+  for (const company of ordered) {
+    const expectedSequence = getConfigSequence();
     try {
       const raw = await ctx.config.get(company.id);
-      if (adoptConfig(ctx, raw, { companyId: company.id, source: "startup-walk" })) {
+      if (
+        adoptConfig(ctx, raw, {
+          companyId: company.id,
+          source: "startup-walk",
+          expectedSequence,
+        })
+      ) {
         return true;
       }
+      // A delivery beat us to it while this read was in flight: that config wins.
+      if (isBootstrapped()) return true;
     } catch (err) {
       const message = recordBootstrapError(err);
       ctx.logger.debug("Startup config walk: config read denied", {
@@ -182,7 +253,7 @@ export async function runStartupConfigWalk(ctx: PluginContext): Promise<boolean>
 
   ctx.logger.info(
     "Startup config walk found no readable company config — running on defaults until the host delivers one",
-    { companiesSeen: companies.length },
+    { companiesSeen: ordered.length, walkLimit: WALK_COMPANY_LIMIT },
   );
   return false;
 }
@@ -783,6 +854,11 @@ const plugin = definePlugin({
     // when a company config was expected but the host refused to hand one over
     // (the v2026.720.0 / v2026.722.0 gate), so operators see the real host
     // message instead of silence, and when a circuit breaker is open.
+    //
+    // A failed `companies.list()` is NOT such a refusal: the listing is an
+    // optional convenience for the startup walk, and the host delivers config
+    // through `onConfigChanged` whether or not the plugin can enumerate
+    // companies. It is reported in the details and never in the status.
     const configDenied = !runtime.bootstrapped && runtime.lastBootstrapError !== null;
 
     return {
@@ -798,6 +874,7 @@ const plugin = definePlugin({
         configCompanyId: runtime.companyId,
         configBootstrapped: runtime.bootstrapped,
         lastConfigError: runtime.lastBootstrapError,
+        lastCompanyListingError: runtime.lastCompanyListingError,
       },
     };
   },

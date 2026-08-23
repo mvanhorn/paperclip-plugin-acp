@@ -48,16 +48,43 @@ export type RuntimeConfigState = {
   source: ConfigSource;
   /** Human-readable provenance, e.g. `company:8f2c-…` — safe for health output. */
   configSource: string;
-  /** Last host error seen while trying to read config, truncated. Never a secret. */
+  /** Last host error seen while trying to READ CONFIG, truncated. Never a secret. */
   lastBootstrapError: string | null;
+  /**
+   * Last error from the optional `companies.list()` lookup, truncated.
+   *
+   * Kept separate from `lastBootstrapError` on purpose: the company listing is
+   * an optional convenience used by the startup walk, not a configuration read.
+   * A host that does not grant `companies.read` is not refusing our config, so
+   * this must never degrade health.
+   */
+  lastCompanyListingError: string | null;
+  /**
+   * Monotonic counter, incremented on every adoption. Callers that await a host
+   * read capture it beforehand and pass it back as `expectedSequence`, so a slow
+   * read can never overwrite a newer configuration that landed meanwhile.
+   */
+  sequence: number;
 };
 
 /** Result of an attempted config adoption. */
 export type ApplyConfigResult = {
   /** True when the incoming config became the active one. */
   applied: boolean;
-  /** Why an adoption was skipped, when `applied` is false. */
-  skippedReason?: "other-company";
+  /**
+   * Why an adoption was skipped, when `applied` is false.
+   *
+   * - `other-company`: a second company's config arrived while one is running.
+   * - `stale-snapshot`: the caller's read resolved after a newer config landed.
+   */
+  skippedReason?: "other-company" | "stale-snapshot";
+  /**
+   * True when an unscoped (company-less) delivery replaced a configuration that
+   * a known company owned. Hosts before v2026.817.0 call `onConfigChanged` with
+   * no company context at all, so a second company's save is indistinguishable
+   * from a refresh of the running one — the caller warns on this.
+   */
+  legacyUnscopedReplace?: boolean;
   /** True when `reaperIntervalMs` changed, so the caller must restart the timer. */
   reaperIntervalChanged: boolean;
   /** The company that owns the active config after this call. */
@@ -108,6 +135,8 @@ let bootstrapped = false;
 let activeCompanyId: string | null = null;
 let source: ConfigSource = "defaults";
 let lastBootstrapError: string | null = null;
+let lastCompanyListingError: string | null = null;
+let sequence = 0;
 
 /** The configuration every handler must read at dispatch time. */
 export function getConfig(): AcpConfig {
@@ -122,7 +151,17 @@ export function getRuntimeConfigState(): RuntimeConfigState {
     source,
     configSource: describeSource(),
     lastBootstrapError,
+    lastCompanyListingError,
+    sequence,
   };
+}
+
+/**
+ * The current adoption sequence. Capture this before awaiting a host config
+ * read and hand it back to `applyCompanyConfig` as `expectedSequence`.
+ */
+export function getConfigSequence(): number {
+  return sequence;
 }
 
 function describeSource(): string {
@@ -147,12 +186,25 @@ export function getActiveCompanyId(): string | null {
  * (e.g. `company context is required`) in the health payload.
  */
 export function recordBootstrapError(err: unknown): string {
-  const message = err instanceof Error ? err.message : String(err);
-  lastBootstrapError =
-    message.length > MAX_ERROR_LENGTH
-      ? `${message.slice(0, MAX_ERROR_LENGTH)}…`
-      : message;
+  lastBootstrapError = truncate(err);
   return lastBootstrapError;
+}
+
+/**
+ * Record a failure of the optional `companies.list()` lookup. Deliberately does
+ * NOT touch `lastBootstrapError`: a denied listing is not a refused config read
+ * and must not degrade health.
+ */
+export function recordCompanyListingError(err: unknown): string {
+  lastCompanyListingError = truncate(err);
+  return lastCompanyListingError;
+}
+
+function truncate(err: unknown): string {
+  const message = err instanceof Error ? err.message : String(err);
+  return message.length > MAX_ERROR_LENGTH
+    ? `${message.slice(0, MAX_ERROR_LENGTH)}…`
+    : message;
 }
 
 /**
@@ -165,8 +217,26 @@ export function recordBootstrapError(err: unknown): string {
  */
 export function applyCompanyConfig(
   raw: unknown,
-  opts: { companyId: string | null; source: ConfigSource },
+  opts: {
+    companyId: string | null;
+    source: ConfigSource;
+    /**
+     * The sequence observed before the caller awaited a host read. When it no
+     * longer matches, a newer configuration landed while that read was in
+     * flight and this snapshot is dropped instead of overwriting it.
+     */
+    expectedSequence?: number;
+  },
 ): ApplyConfigResult {
+  if (opts.expectedSequence !== undefined && opts.expectedSequence !== sequence) {
+    return {
+      applied: false,
+      skippedReason: "stale-snapshot",
+      reaperIntervalChanged: false,
+      companyId: activeCompanyId,
+    };
+  }
+
   if (
     bootstrapped &&
     activeCompanyId !== null &&
@@ -181,6 +251,9 @@ export function applyCompanyConfig(
     };
   }
 
+  const legacyUnscopedReplace =
+    bootstrapped && activeCompanyId !== null && opts.companyId === null;
+
   const next = resolveConfig(raw);
   const reaperIntervalChanged = next.reaperIntervalMs !== current.reaperIntervalMs;
 
@@ -189,11 +262,13 @@ export function applyCompanyConfig(
   source = opts.source;
   if (opts.companyId !== null) activeCompanyId = opts.companyId;
   lastBootstrapError = null;
+  sequence += 1;
 
   return {
     applied: true,
     reaperIntervalChanged,
     companyId: activeCompanyId,
+    legacyUnscopedReplace,
   };
 }
 
@@ -204,4 +279,6 @@ export function resetRuntimeConfig(): void {
   activeCompanyId = null;
   source = "defaults";
   lastBootstrapError = null;
+  lastCompanyListingError = null;
+  sequence = 0;
 }
