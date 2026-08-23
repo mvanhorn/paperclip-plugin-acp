@@ -130,6 +130,16 @@ in the table above — it is fully functional, just untuned. The plugin health
 panel shows where the active configuration came from (`configSource`) and, if
 the host refused a read, the exact host error.
 
+#### Upgrading an existing install
+
+This version declares one additional capability, `companies.read`, used by the
+startup config walk. Paperclip treats any added capability as an escalation that
+needs approval and refuses the in-place upgrade — and current hosts stop the
+running worker *before* that check, so the plugin is left stopped and on the old
+version. Remove and reinstall the plugin instead of upgrading it, or approve the
+capability escalation if your host offers that path. A fresh install is
+unaffected.
+
 The plugin runs a **single company's configuration** per worker. The first
 company whose configuration resolves owns the runtime; a later save for that
 same company refreshes it. Companies are examined in ascending id order, the
