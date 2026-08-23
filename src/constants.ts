@@ -1,5 +1,23 @@
+import { createRequire } from "node:module";
+
 export const PLUGIN_ID = "paperclip-plugin-acp";
-export const PLUGIN_VERSION = "0.3.0";
+
+/**
+ * The published package version, read from `package.json` at load time.
+ *
+ * The manifest advertises this constant, and a hand-maintained copy drifted
+ * from the release every time (0.3.0 in the constant vs 0.6.0 in the package),
+ * so Paperclip recorded a stale plugin version after every install. Reading the
+ * package manifest removes the manual bump step entirely.
+ *
+ * `createRequire` is used rather than a JSON import so the resolution works
+ * identically from `src/` (tests), `dist/` (runtime) and the published tarball,
+ * without widening `rootDir` and reshaping the build output.
+ */
+const require = createRequire(import.meta.url);
+const pkg = require("../package.json") as { version: string };
+
+export const PLUGIN_VERSION: string = pkg.version;
 
 export const DEFAULT_CONFIG = {
   enabledAgents: "claude,codex,gemini,opencode",

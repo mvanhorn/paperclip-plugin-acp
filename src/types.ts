@@ -260,6 +260,26 @@ export type OrchestrationConfig = {
 };
 
 /**
+ * The plugin's resolved runtime configuration: the ACP session fields from
+ * `instanceConfigSchema` merged with the Phase 2 orchestration fields.
+ *
+ * Always read this through `getConfig()` at dispatch time — the worker boots on
+ * defaults and adopts a company's configuration later, so a value captured at
+ * `setup()` time goes stale the moment the host delivers a config.
+ */
+export type AcpConfig = {
+  enabledAgents: string;
+  defaultAgent: string;
+  defaultMode: AcpSessionMode;
+  defaultCwd: string;
+  sessionIdleTimeoutMs: number;
+  sessionMaxAgeMs: number;
+  maxSessionsPerThread: number;
+  reaperIntervalMs: number;
+  sessionRowTtlDays: number;
+} & OrchestrationConfig;
+
+/**
  * Result of a pre-spawn orchestration check.
  * If `allowed` is false, `reason` explains why the spawn was rejected.
  */
