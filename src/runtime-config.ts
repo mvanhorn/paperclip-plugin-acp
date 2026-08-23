@@ -10,18 +10,19 @@
  *
  * The fix is to stop treating configuration as a startup prerequisite. The
  * worker always boots on safe defaults, registers everything, and then adopts a
- * company's configuration whenever one becomes reachable:
+ * company's configuration when the host provides one:
  *
- *   1. `onConfigChanged` — the host delivers stored config at startup and on
- *      every save, with the company scope attached;
- *   2. the first company-scoped invocation (event or tool call) that carries a
- *      `companyId`;
- *   3. a best-effort startup walk over `companies.list()` + `config.get(id)`.
+ *   1. `onConfigChanged` — the host replays stored configuration at worker start
+ *      (Paperclip >= v2026.817.0) and delivers every save, with the scope;
+ *   2. the first company-scoped invocation, when nothing has been adopted yet.
  *
- * Single-runtime company model: the first company whose config resolves wins.
- * A later delivery for the same company refreshes the config; a delivery for a
- * different company is logged and ignored (the plugin does not declare
- * `multiCompanyConfig`). Multi-company support is a documented follow-up.
+ * Single-runtime company model, mirroring the SDK's own single-tenant guard so
+ * the two never disagree about who owns the worker: the first delivered company
+ * owns it, a later delivery for that same company refreshes it, and a delivery
+ * for a different company is refused — UNLESS its configuration is identical, in
+ * which case ownership advances to it exactly as the SDK's guard does. The
+ * plugin does not declare `multiCompanyConfig`; multi-company support is a
+ * documented follow-up.
  */
 
 import { DEFAULT_CONFIG, ORCHESTRATION_DEFAULTS } from "./constants.js";
@@ -31,8 +32,6 @@ import type { AcpConfig, AcpSessionMode } from "./types.js";
 export type ConfigSource =
   /** No company config has landed yet — every value is a built-in default. */
   | "defaults"
-  /** Adopted from the best-effort `companies.list()` + `config.get(id)` walk. */
-  | "startup-walk"
   /** Adopted from an `onConfigChanged` delivery by the host. */
   | "config-changed"
   /** Adopted from the first company-scoped invocation (event or tool call). */
@@ -50,15 +49,6 @@ export type RuntimeConfigState = {
   configSource: string;
   /** Last host error seen while trying to READ CONFIG, truncated. Never a secret. */
   lastBootstrapError: string | null;
-  /**
-   * Last error from the optional `companies.list()` lookup, truncated.
-   *
-   * Kept separate from `lastBootstrapError` on purpose: the company listing is
-   * an optional convenience used by the startup walk, not a configuration read.
-   * A host that does not grant `companies.read` is not refusing our config, so
-   * this must never degrade health.
-   */
-  lastCompanyListingError: string | null;
   /**
    * Monotonic counter, incremented on every adoption. Callers that await a host
    * read capture it beforehand and pass it back as `expectedSequence`, so a slow
@@ -78,6 +68,14 @@ export type ApplyConfigResult = {
    * - `stale-snapshot`: the caller's read resolved after a newer config landed.
    */
   skippedReason?: "other-company" | "stale-snapshot";
+  /**
+   * True when ownership moved to a different company because its configuration
+   * was identical to the running one. The SDK's guard allows exactly this (an
+   * idempotent replay of the same config under another scope, which legacy
+   * duplicate config rows produce) and advances its own owner with it, so the
+   * plugin must advance too or the two disagree about who owns the worker.
+   */
+  ownerAdvanced?: boolean;
   /**
    * True when an unscoped (company-less) delivery replaced a configuration that
    * a known company owned. Hosts before v2026.817.0 call `onConfigChanged` with
@@ -135,8 +133,13 @@ let bootstrapped = false;
 let activeCompanyId: string | null = null;
 let source: ConfigSource = "defaults";
 let lastBootstrapError: string | null = null;
-let lastCompanyListingError: string | null = null;
 let sequence = 0;
+/**
+ * The raw configuration exactly as the host last delivered it. Ownership
+ * decisions compare against this rather than the merged view, because the SDK's
+ * guard compares the raw payloads.
+ */
+let lastRawConfig: unknown = undefined;
 
 /** The configuration every handler must read at dispatch time. */
 export function getConfig(): AcpConfig {
@@ -151,7 +154,6 @@ export function getRuntimeConfigState(): RuntimeConfigState {
     source,
     configSource: describeSource(),
     lastBootstrapError,
-    lastCompanyListingError,
     sequence,
   };
 }
@@ -188,16 +190,6 @@ export function getActiveCompanyId(): string | null {
 export function recordBootstrapError(err: unknown): string {
   lastBootstrapError = truncate(err);
   return lastBootstrapError;
-}
-
-/**
- * Record a failure of the optional `companies.list()` lookup. Deliberately does
- * NOT touch `lastBootstrapError`: a denied listing is not a refused config read
- * and must not degrade health.
- */
-export function recordCompanyListingError(err: unknown): string {
-  lastCompanyListingError = truncate(err);
-  return lastCompanyListingError;
 }
 
 function truncate(err: unknown): string {
@@ -237,12 +229,20 @@ export function applyCompanyConfig(
     };
   }
 
-  if (
+  // Mirror of the SDK's fail-closed cross-tenant guard
+  // (`handleConfigChanged` in worker-rpc-host): a different company is refused
+  // only when it brings a DIFFERENT configuration. An identical configuration
+  // under another scope is an idempotent replay — legacy duplicate config rows
+  // produce exactly that — and the SDK advances its owner to it, so the plugin
+  // advances too. Diverging here would leave the SDK rejecting our owner's saves
+  // before they ever reach the hook.
+  const otherCompany =
     bootstrapped &&
     activeCompanyId !== null &&
     opts.companyId !== null &&
-    opts.companyId !== activeCompanyId
-  ) {
+    opts.companyId !== activeCompanyId;
+
+  if (otherCompany && !configsEqual(raw, lastRawConfig)) {
     return {
       applied: false,
       skippedReason: "other-company",
@@ -261,6 +261,7 @@ export function applyCompanyConfig(
   bootstrapped = true;
   source = opts.source;
   if (opts.companyId !== null) activeCompanyId = opts.companyId;
+  lastRawConfig = raw;
   lastBootstrapError = null;
   sequence += 1;
 
@@ -269,7 +270,31 @@ export function applyCompanyConfig(
     reaperIntervalChanged,
     companyId: activeCompanyId,
     legacyUnscopedReplace,
+    ownerAdvanced: otherCompany,
   };
+}
+
+/**
+ * Configuration equality, canonicalized the same way the SDK canonicalizes it
+ * (key order ignored, `undefined` members dropped) so the plugin's ownership
+ * decision matches the host's for the same pair of payloads.
+ */
+function configsEqual(a: unknown, b: unknown): boolean {
+  return canonicalize(a) === canonicalize(b);
+}
+
+function canonicalize(value: unknown): string {
+  if (value === null || typeof value !== "object") {
+    return JSON.stringify(value) ?? "null";
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalize).join(",")}]`;
+  }
+  const entries = Object.entries(value as Record<string, unknown>)
+    .filter(([, v]) => v !== undefined)
+    .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+    .map(([key, v]) => `${JSON.stringify(key)}:${canonicalize(v)}`);
+  return `{${entries.join(",")}}`;
 }
 
 /** Reset to built-in defaults. Test-only. */
@@ -279,6 +304,6 @@ export function resetRuntimeConfig(): void {
   activeCompanyId = null;
   source = "defaults";
   lastBootstrapError = null;
-  lastCompanyListingError = null;
+  lastRawConfig = undefined;
   sequence = 0;
 }

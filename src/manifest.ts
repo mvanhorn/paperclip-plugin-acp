@@ -19,11 +19,6 @@ const manifest: PaperclipPluginManifestV1 = {
     "activity.log.write",
     "metrics.write",
     "agent.tools.register",
-    // Needed by the startup config walk: on hosts that seed proactive company
-    // scopes (>= v2026.817.0) the worker lists companies and reads each one's
-    // stored config to bootstrap itself. Denied gracefully on hosts that do not
-    // grant it — the plugin then waits for an `onConfigChanged` delivery.
-    "companies.read",
   ],
   entrypoints: {
     worker: "./dist/worker.js",

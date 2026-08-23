@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import plugin, { stopReaper } from "../src/worker.js";
+import plugin, { resetInvocationGate, stopReaper } from "../src/worker.js";
 import {
   getConfig,
   getRuntimeConfigState,
@@ -17,18 +17,14 @@ import type { PluginContext } from "@paperclipai/plugin-sdk";
  * adopt a company's configuration later — from the startup walk, from an
  * `onConfigChanged` delivery, or from the first company-scoped invocation.
  *
- * The mocks below model three hosts:
- *   - pre-720 / capability denied — `companies.list` fails;
- *   - v2026.720.0 / v2026.722.0   — every `config.get` is denied, scoped or not;
- *   - >= v2026.817.0              — scoped `config.get` resolves for companies
- *                                   that already have a stored config row,
- *                                   unscoped is still denied.
+ * Configuration arrives from two places only: an `onConfigChanged` delivery
+ * (the host replays stored configuration at worker start on >= v2026.817.0 and
+ * delivers every save) and a company-scoped invocation when nothing has been
+ * adopted yet. `setup()` reads no configuration at all.
  */
 
 const SCOPE_DENIED =
   'plugin "paperclip-plugin-acp" is not allowed to perform "config.get": company context is required';
-const CAPABILITY_DENIED =
-  'plugin "paperclip-plugin-acp" is missing capability "companies.read"';
 
 type EventHandler = (event: { payload: unknown }) => unknown;
 
@@ -36,8 +32,8 @@ type HostMock = {
   ctx: PluginContext;
   /** `companyId` argument of every `config.get` call, in order. */
   configGetCalls: Array<string | undefined>;
-  /** Arguments of every `companies.list` call, in order. */
-  listCalls: Array<{ limit?: number; offset?: number } | undefined>;
+  /** Everything written to plugin state, to prove a refusal changed nothing. */
+  stateWrites: string[];
   listeners: Map<string, EventHandler[]>;
   tools: Map<string, (params: unknown, runCtx: unknown) => unknown>;
   emitted: Array<{ event: string; args: unknown[] }>;
@@ -45,15 +41,13 @@ type HostMock = {
 };
 
 function createHost(opts: {
-  /** Companies visible to the plugin, or a thrown error for a failed listing. */
-  companies?: Array<{ id: string }> | (() => never);
   /** Stored config rows by company id. A missing entry means the read is denied. */
   configs?: Record<string, Record<string, unknown>>;
   /** Intercepts `config.get` entirely — used for the in-flight read race. */
   configGet?: (companyId?: string) => Promise<Record<string, unknown>>;
-}): HostMock {
+} = {}): HostMock {
   const configGetCalls: Array<string | undefined> = [];
-  const listCalls: Array<{ limit?: number; offset?: number } | undefined> = [];
+  const stateWrites: string[] = [];
   const listeners = new Map<string, EventHandler[]>();
   const tools = new Map<string, (params: unknown, runCtx: unknown) => unknown>();
   const emitted: Array<{ event: string; args: unknown[] }> = [];
@@ -70,20 +64,6 @@ function createHost(opts: {
         const row = opts.configs?.[companyId];
         if (!row) throw new Error(SCOPE_DENIED);
         return row;
-      },
-    },
-    companies: {
-      async list(input?: { limit?: number; offset?: number }) {
-        listCalls.push(input);
-        if (typeof opts.companies === "function") opts.companies();
-        const all = opts.companies ?? [];
-        const offset = input?.offset ?? 0;
-        return input?.limit == null
-          ? all.slice(offset)
-          : all.slice(offset, offset + input.limit);
-      },
-      async get(id: string) {
-        return (Array.isArray(opts.companies) ? opts.companies : []).find((c) => c.id === id) ?? null;
       },
     },
     events: {
@@ -110,6 +90,7 @@ function createHost(opts: {
         return state.get(key.stateKey) ?? null;
       },
       async set(key: { stateKey: string }, value: unknown) {
+        stateWrites.push(key.stateKey);
         state.set(key.stateKey, value);
       },
       async delete(key: { stateKey: string }) {
@@ -127,7 +108,7 @@ function createHost(opts: {
     },
   } as unknown as PluginContext;
 
-  return { ctx, configGetCalls, listCalls, listeners, tools, emitted, warnings };
+  return { ctx, configGetCalls, stateWrites, listeners, tools, emitted, warnings };
 }
 
 /** Every registration `setup()` must complete regardless of config access. */
@@ -165,6 +146,7 @@ const definition = plugin.definition;
 
 beforeEach(() => {
   resetRuntimeConfig();
+  resetInvocationGate();
   // getPoolStatus() reaches the Paperclip API from onHealth; keep it offline.
   vi.stubGlobal(
     "fetch",
@@ -180,34 +162,49 @@ afterEach(() => {
 
 describe("host matrix: v2026.720.0 / v2026.722.0 (every config read denied)", () => {
   it("completes setup, registers everything, and never reads config unscoped", async () => {
-    const host = createHost({ companies: [{ id: "company-1" }] });
+    const host = createHost();
 
     await expect(definition.setup(host.ctx)).resolves.toBeUndefined();
 
     assertFullyRegistered(host);
-    expect(host.configGetCalls.length).toBeGreaterThan(0);
-    expect(host.configGetCalls.every((id) => typeof id === "string" && id.length > 0)).toBe(true);
+    // setup() runs outside any company scope, so it must not read config at all.
+    expect(host.configGetCalls).toEqual([]);
 
     const state = getRuntimeConfigState();
     expect(state.bootstrapped).toBe(false);
     expect(state.configSource).toBe("defaults");
-    expect(state.lastBootstrapError).toContain("company context is required");
     expect(getConfig().defaultAgent).toBe(DEFAULT_CONFIG.defaultAgent);
   });
 
-  it("reports degraded health carrying the real host error", async () => {
-    const host = createHost({ companies: [{ id: "company-1" }] });
+  it("is healthy on defaults, and degrades only once the host refuses a read", async () => {
+    const host = createHost();
     await definition.setup(host.ctx);
 
-    const health = await definition.onHealth!();
-    expect(health.status).toBe("degraded");
-    expect(health.message).toContain("company context is required");
-    expect(health.details?.configSource).toBe("defaults");
-    expect(health.details?.configBootstrapped).toBe(false);
+    // Nothing was asked of the host yet, so there is nothing to report.
+    const atBoot = await definition.onHealth!();
+    expect(atBoot.status).toBe("ok");
+    expect(atBoot.message).toBeUndefined();
+    expect(atBoot.details?.configSource).toBe("defaults");
+    expect(atBoot.details?.configBootstrapped).toBe(false);
+
+    // A company-scoped invocation tries to read, and this host denies it.
+    const handler = host.listeners.get("plugin.paperclip-plugin-telegram.acp-spawn")![0];
+    await handler({
+      payload: {
+        agentName: "not-a-real-agent",
+        chatId: "chat-1",
+        threadId: "thread-1",
+        companyId: "company-1",
+      },
+    });
+
+    const afterDenial = await definition.onHealth!();
+    expect(afterDenial.status).toBe("degraded");
+    expect(afterDenial.message).toContain("company context is required");
   });
 
   it("bootstraps from an onConfigChanged delivery without a worker restart", async () => {
-    const host = createHost({ companies: [{ id: "company-1" }] });
+    const host = createHost();
     await definition.setup(host.ctx);
     expect(getRuntimeConfigState().bootstrapped).toBe(false);
 
@@ -236,7 +233,7 @@ describe("host matrix: v2026.720.0 / v2026.722.0 (every config read denied)", ()
     // The walk finds nothing readable, then traffic arrives for a company whose
     // config the host will serve under an invocation scope.
     const configs: Record<string, Record<string, unknown>> = {};
-    const host = createHost({ companies: [{ id: "company-1" }], configs });
+    const host = createHost({ configs });
     await definition.setup(host.ctx);
     expect(getRuntimeConfigState().bootstrapped).toBe(false);
 
@@ -262,248 +259,6 @@ describe("host matrix: v2026.720.0 / v2026.722.0 (every config read denied)", ()
   });
 });
 
-describe("host matrix: >= v2026.817.0 (scoped reads resolve)", () => {
-  it("bootstraps from the startup walk, skipping companies with no readable config", async () => {
-    const host = createHost({
-      companies: [{ id: "company-a" }, { id: "company-b" }],
-      configs: { "company-b": { defaultAgent: "opencode", maxSessionsPerThread: 9 } },
-    });
-
-    await definition.setup(host.ctx);
-
-    assertFullyRegistered(host);
-    expect(host.listCalls).toEqual([{ limit: 1001, offset: 0 }]);
-    expect(host.configGetCalls).toEqual(["company-a", "company-b"]);
-
-    const state = getRuntimeConfigState();
-    expect(state.bootstrapped).toBe(true);
-    expect(state.companyId).toBe("company-b");
-    expect(state.source).toBe("startup-walk");
-    expect(getConfig().defaultAgent).toBe("opencode");
-    expect(getConfig().maxSessionsPerThread).toBe(9);
-
-    const health = await definition.onHealth!();
-    expect(health.status).toBe("ok");
-    expect(health.details?.configSource).toBe("company:company-b");
-  });
-
-  it("fresh install: the walk finds nothing, a later save bootstraps the runtime", async () => {
-    const host = createHost({ companies: [] });
-
-    await definition.setup(host.ctx);
-    assertFullyRegistered(host);
-    expect(host.configGetCalls).toEqual([]);
-    expect(getRuntimeConfigState().bootstrapped).toBe(false);
-    // No config row exists yet, so there is no host error to report.
-    expect((await definition.onHealth!()).status).toBe("ok");
-
-    await definition.onConfigChanged!({ defaultAgent: "codex" }, { companyId: "company-1" });
-
-    expect(getRuntimeConfigState().bootstrapped).toBe(true);
-    expect(getConfig().defaultAgent).toBe("codex");
-  });
-});
-
-describe("host matrix: pre-720 / companies.read not granted", () => {
-  it("survives a failing companies.list and stays on defaults", async () => {
-    const host = createHost({
-      companies: () => {
-        throw new Error(CAPABILITY_DENIED);
-      },
-    });
-
-    await expect(definition.setup(host.ctx)).resolves.toBeUndefined();
-
-    assertFullyRegistered(host);
-    expect(host.configGetCalls).toEqual([]);
-
-    const state = getRuntimeConfigState();
-    expect(state.bootstrapped).toBe(false);
-    // The listing failure is recorded apart from config reads: the host did not
-    // refuse our configuration, so it must not be reported as a config error.
-    expect(state.lastCompanyListingError).toContain('missing capability "companies.read"');
-    expect(state.lastBootstrapError).toBeNull();
-
-    // The runtime is fully functional on defaults, so health stays ok and the
-    // listing failure is visible in the details only.
-    const health = await definition.onHealth!();
-    expect(health.status).toBe("ok");
-    expect(health.message).toBeUndefined();
-    expect(health.details?.lastCompanyListingError).toContain(
-      'missing capability "companies.read"',
-    );
-  });
-});
-
-describe("walk ownership matches the host's replay order", () => {
-  it("adopts the lowest companyId when several companies have a readable config", async () => {
-    // companies.list() has no ORDER BY on the host, but the startup config
-    // replay is sorted by companyId ascending and the SDK's own single-tenant
-    // guard binds to the first company it replays. Walking in list order could
-    // leave this plugin owning a different company than the SDK does, after
-    // which neither company's saves can reach the runtime.
-    const host = createHost({
-      companies: [{ id: "company-z" }, { id: "company-a" }],
-      configs: {
-        "company-z": { defaultAgent: "gemini" },
-        "company-a": { defaultAgent: "codex" },
-      },
-    });
-
-    await definition.setup(host.ctx);
-
-    expect(host.configGetCalls[0]).toBe("company-a");
-    expect(getRuntimeConfigState().companyId).toBe("company-a");
-    expect(getConfig().defaultAgent).toBe("codex");
-  });
-
-  it("sorts the complete company set, not one arbitrary page", async () => {
-    // The host pages `companies.list()` and gives it no ordering contract, so
-    // the globally lowest configured company can sit in any page. Sorting only
-    // the first page would bind this plugin to a different company than the
-    // host's replay picks, and neither side's saves could then reach the other.
-    const host = createHost({
-      companies: [
-        ...Array.from({ length: 25 }, (_, i) => ({
-          id: `z-company-${String(i).padStart(2, "0")}`,
-        })),
-        { id: "a-company" },
-      ],
-      configs: {
-        "z-company-00": { defaultAgent: "gemini" },
-        "a-company": { defaultAgent: "codex" },
-      },
-    });
-
-    await definition.setup(host.ctx);
-
-    // One bounded snapshot, taken in full before any config read.
-    expect(host.listCalls).toEqual([{ limit: 1001, offset: 0 }]);
-    // `a-company` sorts first across the whole set, and it is readable, so the
-    // walk stops there — the same company the host's replay would bind to.
-    expect(host.configGetCalls).toEqual(["a-company"]);
-    expect(getRuntimeConfigState().companyId).toBe("a-company");
-    expect(getConfig().defaultAgent).toBe("codex");
-  });
-
-  it("takes exactly one bounded snapshot instead of paging", async () => {
-    // The host answers every list call by re-running an unordered query and
-    // slicing the fresh result, so consecutive offset windows can overlap, omit
-    // a company, and still end in a short page that looks like the end of the
-    // data. Offset paging cannot prove completeness here; one bounded request
-    // can, so there must never be a second call.
-    const host = createHost({
-      companies: [
-        ...Array.from({ length: 149 }, (_, i) => ({
-          id: `m-company-${String(i).padStart(3, "0")}`,
-        })),
-        { id: "a-company" },
-      ],
-      configs: { "a-company": { defaultAgent: "codex" } },
-    });
-
-    await definition.setup(host.ctx);
-
-    expect(host.listCalls).toEqual([{ limit: 1001, offset: 0 }]);
-    expect(host.configGetCalls).toEqual(["a-company"]);
-    expect(getRuntimeConfigState().companyId).toBe("a-company");
-  });
-
-  it("accepts a snapshot exactly at the ceiling", async () => {
-    const host = createHost({
-      companies: Array.from({ length: 1000 }, (_, i) => ({
-        id: `company-${String(i).padStart(4, "0")}`,
-      })),
-      configs: { "company-0003": { defaultAgent: "codex" } },
-    });
-
-    await definition.setup(host.ctx);
-
-    expect(host.listCalls).toEqual([{ limit: 1001, offset: 0 }]);
-    // Sorted prefix, stopping at the first readable config.
-    expect(host.configGetCalls).toEqual([
-      "company-0000",
-      "company-0001",
-      "company-0002",
-      "company-0003",
-    ]);
-    expect(getRuntimeConfigState().companyId).toBe("company-0003");
-  });
-
-  it("bounds how many companies it probes when none is readable", async () => {
-    const host = createHost({
-      companies: Array.from({ length: 60 }, (_, i) => ({
-        id: `company-${String(i).padStart(3, "0")}`,
-      })),
-    });
-
-    await definition.setup(host.ctx);
-
-    // Probing a prefix of the globally sorted set can never pick the wrong
-    // owner — it stops at the first readable config — so the probe count stays
-    // bounded even though the listing enumerates everything.
-    expect(host.configGetCalls).toHaveLength(25);
-    expect(host.configGetCalls[0]).toBe("company-000");
-    expect(host.configGetCalls[24]).toBe("company-024");
-    expect(getRuntimeConfigState().bootstrapped).toBe(false);
-  });
-
-  it("gives up ownership selection at one company past the ceiling", async () => {
-    // 1001 is the boundary: with the old offset paging this ended in a short
-    // final page that broke the loop before the ceiling check and adopted an
-    // owner anyway. The single bounded request cannot miss it.
-    const host = createHost({
-      companies: Array.from({ length: 1001 }, (_, i) => ({
-        id: `company-${String(i).padStart(5, "0")}`,
-      })),
-      configs: { "company-00000": { defaultAgent: "codex" } },
-    });
-
-    await definition.setup(host.ctx);
-
-    // No owner may be chosen from a set that was never fully established, even
-    // though the lowest company here has a readable config.
-    expect(host.listCalls).toEqual([{ limit: 1001, offset: 0 }]);
-    expect(host.configGetCalls).toEqual([]);
-    expect(getRuntimeConfigState().bootstrapped).toBe(false);
-    expect(host.warnings.some((w) => w.message.includes("Too many companies"))).toBe(true);
-
-    // The delivery path still bootstraps it.
-    await definition.onConfigChanged!({ defaultAgent: "codex" }, { companyId: "company-00042" });
-    expect(getRuntimeConfigState().companyId).toBe("company-00042");
-  });
-
-  it("does not select an owner when the listing fails", async () => {
-    const host = createHost({
-      companies: () => {
-        throw new Error("transient listing failure");
-      },
-      configs: { "company-000": { defaultAgent: "codex" } },
-    });
-
-    await definition.setup(host.ctx);
-
-    expect(host.configGetCalls).toEqual([]);
-    expect(getRuntimeConfigState().bootstrapped).toBe(false);
-    expect(getRuntimeConfigState().lastCompanyListingError).toContain("transient listing failure");
-  });
-
-  it("stops at the first company with a readable config", async () => {
-    const host = createHost({
-      companies: [{ id: "company-a" }, { id: "company-b" }, { id: "company-c" }],
-      configs: {
-        "company-b": { defaultAgent: "codex" },
-        "company-c": { defaultAgent: "gemini" },
-      },
-    });
-
-    await definition.setup(host.ctx);
-
-    expect(host.configGetCalls).toEqual(["company-a", "company-b"]);
-    expect(getRuntimeConfigState().companyId).toBe("company-b");
-  });
-});
-
 describe("a slow config read never overwrites a newer save", () => {
   it("drops an invocation read that resolves after a delivery", async () => {
     let release!: (config: Record<string, unknown>) => void;
@@ -512,7 +267,6 @@ describe("a slow config read never overwrites a newer save", () => {
     });
 
     const host = createHost({
-      companies: [],
       configGet: () => pending,
     });
     await definition.setup(host.ctx);
@@ -540,36 +294,13 @@ describe("a slow config read never overwrites a newer save", () => {
     expect(getConfig().defaultAgent).toBe("codex");
     expect(getRuntimeConfigState().source).toBe("config-changed");
   });
-
-  it("drops a startup-walk read that resolves after a delivery", async () => {
-    let release!: (config: Record<string, unknown>) => void;
-    const pending = new Promise<Record<string, unknown>>((resolve) => {
-      release = resolve;
-    });
-
-    const host = createHost({
-      companies: [{ id: "company-a" }],
-      configGet: () => pending,
-    });
-
-    const setupDone = definition.setup(host.ctx);
-    await new Promise((resolve) => setImmediate(resolve));
-
-    await definition.onConfigChanged!({ defaultAgent: "codex" }, { companyId: "company-a" });
-    release({ defaultAgent: "gemini" });
-    await setupDone;
-
-    expect(getConfig().defaultAgent).toBe("codex");
-  });
 });
 
 describe("single-company runtime model", () => {
   it("refreshes configuration when the same company saves again", async () => {
-    const host = createHost({
-      companies: [{ id: "company-1" }],
-      configs: { "company-1": { defaultAgent: "codex" } },
-    });
+    const host = createHost();
     await definition.setup(host.ctx);
+    await definition.onConfigChanged!({ defaultAgent: "codex" }, { companyId: "company-1" });
     expect(getConfig().defaultAgent).toBe("codex");
 
     await definition.onConfigChanged!({ defaultAgent: "gemini" }, { companyId: "company-1" });
@@ -578,12 +309,10 @@ describe("single-company runtime model", () => {
     expect(getRuntimeConfigState().companyId).toBe("company-1");
   });
 
-  it("keeps the running company when a second company's config is delivered", async () => {
-    const host = createHost({
-      companies: [{ id: "company-1" }],
-      configs: { "company-1": { defaultAgent: "codex" } },
-    });
+  it("keeps the running company when a second company brings a different config", async () => {
+    const host = createHost();
     await definition.setup(host.ctx);
+    await definition.onConfigChanged!({ defaultAgent: "codex" }, { companyId: "company-1" });
 
     await definition.onConfigChanged!({ defaultAgent: "gemini" }, { companyId: "company-2" });
 
@@ -596,11 +325,9 @@ describe("single-company runtime model", () => {
     // Hosts before v2026.817.0 call onConfigChanged with no company context at
     // all, so a second company's save looks exactly like a refresh. The plugin
     // cannot tell them apart — it must not swap the running settings mutely.
-    const host = createHost({
-      companies: [{ id: "company-1" }],
-      configs: { "company-1": { defaultAgent: "codex" } },
-    });
+    const host = createHost();
     await definition.setup(host.ctx);
+    await definition.onConfigChanged!({ defaultAgent: "codex" }, { companyId: "company-1" });
     expect(getRuntimeConfigState().companyId).toBe("company-1");
 
     await definition.onConfigChanged!({ defaultAgent: "gemini" }, undefined);
@@ -613,7 +340,7 @@ describe("single-company runtime model", () => {
   });
 
   it("applies an instance-scoped save (companyId null) to the running config", async () => {
-    const host = createHost({ companies: [] });
+    const host = createHost();
     await definition.setup(host.ctx);
 
     await definition.onConfigChanged!({ defaultAgent: "opencode" }, { companyId: null });
@@ -623,10 +350,149 @@ describe("single-company runtime model", () => {
   });
 });
 
+describe("ownership mirrors the SDK's single-tenant guard", () => {
+  it("ordered replay of two distinct configs keeps the first company", async () => {
+    // The host replays every stored config row at worker start, sorted by
+    // company id. The first delivery owns the worker; the SDK refuses to hand a
+    // second, differently-configured company to a single-tenant plugin, and the
+    // plugin must reach the same verdict.
+    const host = createHost();
+    await definition.setup(host.ctx);
+
+    await definition.onConfigChanged!({ defaultAgent: "codex" }, { companyId: "company-a" });
+    await definition.onConfigChanged!({ defaultAgent: "gemini" }, { companyId: "company-b" });
+
+    expect(getRuntimeConfigState().companyId).toBe("company-a");
+    expect(getConfig().defaultAgent).toBe("codex");
+    expect(
+      host.warnings.some((w) => w.message.includes("second company")),
+    ).toBe(true);
+  });
+
+  it("advances ownership to a later company with an identical config", async () => {
+    // Legacy installs duplicated one configuration across every company (host
+    // migration 0164), so the replay delivers byte-equal rows under several
+    // scopes. The SDK treats that as an idempotent replay and moves its own
+    // owner to the last one; if the plugin kept the first, the SDK would reject
+    // the plugin owner's saves before they ever reached the hook.
+    const host = createHost();
+    await definition.setup(host.ctx);
+
+    const shared = { defaultAgent: "codex", maxSessionsPerThread: 3 };
+    await definition.onConfigChanged!({ ...shared }, { companyId: "company-a" });
+    expect(getRuntimeConfigState().companyId).toBe("company-a");
+
+    // Key order differs, contents do not: still an idempotent replay.
+    await definition.onConfigChanged!(
+      { maxSessionsPerThread: 3, defaultAgent: "codex" },
+      { companyId: "company-b" },
+    );
+
+    expect(getRuntimeConfigState().companyId).toBe("company-b");
+    expect(getConfig().defaultAgent).toBe("codex");
+  });
+
+  it("after the advance, the new owner's saves apply and the old owner's are refused", async () => {
+    const host = createHost();
+    await definition.setup(host.ctx);
+
+    const shared = { defaultAgent: "codex" };
+    await definition.onConfigChanged!({ ...shared }, { companyId: "company-a" });
+    await definition.onConfigChanged!({ ...shared }, { companyId: "company-b" });
+    expect(getRuntimeConfigState().companyId).toBe("company-b");
+
+    // company-a now edits its own config: a different config for a company that
+    // no longer owns the worker.
+    await definition.onConfigChanged!({ defaultAgent: "gemini" }, { companyId: "company-a" });
+    expect(getConfig().defaultAgent).toBe("codex");
+    expect(getRuntimeConfigState().companyId).toBe("company-b");
+
+    // The owner's own save still applies.
+    await definition.onConfigChanged!({ defaultAgent: "opencode" }, { companyId: "company-b" });
+    expect(getConfig().defaultAgent).toBe("opencode");
+    expect(getRuntimeConfigState().companyId).toBe("company-b");
+  });
+});
+
+describe("invocations for another company are refused", () => {
+  it("refuses a non-owner event before any read or state change", async () => {
+    const host = createHost({ configs: { "company-b": { defaultAgent: "gemini" } } });
+    await definition.setup(host.ctx);
+    await definition.onConfigChanged!({ defaultAgent: "codex" }, { companyId: "company-a" });
+
+    const readsBefore = host.configGetCalls.length;
+    const writesBefore = host.stateWrites.length;
+    const emittedBefore = host.emitted.length;
+
+    const handler = host.listeners.get("plugin.paperclip-plugin-telegram.acp-spawn")![0];
+    await handler({
+      payload: {
+        agentName: "claude",
+        chatId: "chat-1",
+        threadId: "thread-1",
+        companyId: "company-b",
+      },
+    });
+
+    // Terminal: no config read under the wrong scope, no session state, no work.
+    expect(host.configGetCalls).toHaveLength(readsBefore);
+    expect(host.stateWrites).toHaveLength(writesBefore);
+    expect(host.emitted).toHaveLength(emittedBefore);
+    expect(getRuntimeConfigState().companyId).toBe("company-a");
+    expect(getConfig().defaultAgent).toBe("codex");
+    expect(
+      host.warnings.some((w) => w.message.includes("does not serve")),
+    ).toBe(true);
+  });
+
+  it("refuses a non-owner tool call with an error result", async () => {
+    const host = createHost();
+    await definition.setup(host.ctx);
+    await definition.onConfigChanged!({ defaultAgent: "codex" }, { companyId: "company-a" });
+
+    const spawn = host.tools.get("acp_spawn")!;
+    const result = (await spawn({ agent: "claude" }, { companyId: "company-b" })) as {
+      error?: string;
+    };
+
+    expect(result.error).toContain("different company");
+    expect(host.stateWrites).toEqual([]);
+  });
+
+  it("rate-limits the refusal log for a repeating non-owner company", async () => {
+    const host = createHost();
+    await definition.setup(host.ctx);
+    await definition.onConfigChanged!({ defaultAgent: "codex" }, { companyId: "company-a" });
+
+    const spawn = host.tools.get("acp_spawn")!;
+    for (let i = 0; i < 5; i++) {
+      await spawn({ agent: "claude" }, { companyId: "company-b" });
+    }
+
+    expect(
+      host.warnings.filter((w) => w.message.includes("does not serve")),
+    ).toHaveLength(1);
+  });
+
+  it("serves the owner's own invocations normally", async () => {
+    const host = createHost();
+    await definition.setup(host.ctx);
+    await definition.onConfigChanged!({ defaultAgent: "codex" }, { companyId: "company-a" });
+
+    const spawn = host.tools.get("acp_spawn")!;
+    const result = (await spawn({ agent: "not-a-real-agent" }, { companyId: "company-a" })) as {
+      error?: string;
+    };
+
+    // It reaches the handler: the error is about the agent, not the company.
+    expect(result.error).toContain("Unknown agent");
+  });
+});
+
 describe("reaper follows the live configuration", () => {
   it("restarts the timer only when the scan interval changes", async () => {
     const setIntervalSpy = vi.spyOn(globalThis, "setInterval");
-    const host = createHost({ companies: [] });
+    const host = createHost();
 
     await definition.setup(host.ctx);
     expect(setIntervalSpy).toHaveBeenCalledTimes(1);
@@ -646,7 +512,7 @@ describe("reaper follows the live configuration", () => {
   });
 
   it("ignores null config values instead of overwriting defaults", async () => {
-    const host = createHost({ companies: [] });
+    const host = createHost();
     await definition.setup(host.ctx);
 
     await definition.onConfigChanged!(
