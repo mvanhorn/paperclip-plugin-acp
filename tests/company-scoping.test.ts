@@ -45,8 +45,12 @@ type HostMock = {
 };
 
 function createHost(opts: {
-  /** Companies visible to the plugin, or a thrown error for a denied listing. */
-  companies?: Array<{ id: string }> | (() => never);
+  /**
+   * Companies visible to the plugin. A function is called per page: it may throw
+   * (denied or transient listing failure) or return a page to model a listing
+   * that fails only part-way through.
+   */
+  companies?: Array<{ id: string }> | (() => never) | (() => Array<{ id: string }> | undefined);
   /** Stored config rows by company id. A missing entry means the read is denied. */
   configs?: Record<string, Record<string, unknown>>;
   /** Intercepts `config.get` entirely — used for the in-flight read race. */
@@ -75,7 +79,15 @@ function createHost(opts: {
     companies: {
       async list(input?: { limit?: number; offset?: number }) {
         listCalls.push(input);
-        if (typeof opts.companies === "function") opts.companies();
+        // A function source may throw (denied / transient failure) or return a
+        // page directly, so a partial enumeration can be modelled.
+        if (typeof opts.companies === "function") {
+          const produced = (opts.companies as () => Array<{ id: string }> | undefined)();
+          if (produced !== undefined) return produced;
+          return Array.from({ length: 100 }, (_, i) => ({
+            id: `company-${String(i).padStart(3, "0")}`,
+          }));
+        }
         const all = opts.companies ?? [];
         const offset = input?.offset ?? 0;
         return input?.limit == null
@@ -272,6 +284,7 @@ describe("host matrix: >= v2026.817.0 (scoped reads resolve)", () => {
     await definition.setup(host.ctx);
 
     assertFullyRegistered(host);
+    expect(host.listCalls).toEqual([{ limit: 100, offset: 0 }]);
     expect(host.configGetCalls).toEqual(["company-a", "company-b"]);
 
     const state = getRuntimeConfigState();
@@ -356,7 +369,58 @@ describe("walk ownership matches the host's replay order", () => {
     expect(getConfig().defaultAgent).toBe("codex");
   });
 
-  it("bounds the walk to one page of companies", async () => {
+  it("sorts the complete company set, not one arbitrary page", async () => {
+    // The host pages `companies.list()` and gives it no ordering contract, so
+    // the globally lowest configured company can sit in any page. Sorting only
+    // the first page would bind this plugin to a different company than the
+    // host's replay picks, and neither side's saves could then reach the other.
+    const host = createHost({
+      companies: [
+        ...Array.from({ length: 25 }, (_, i) => ({
+          id: `z-company-${String(i).padStart(2, "0")}`,
+        })),
+        { id: "a-company" },
+      ],
+      configs: {
+        "z-company-00": { defaultAgent: "gemini" },
+        "a-company": { defaultAgent: "codex" },
+      },
+    });
+
+    await definition.setup(host.ctx);
+
+    // Enumerated in full before any config read.
+    expect(host.listCalls).toEqual([{ limit: 100, offset: 0 }]);
+    // `a-company` sorts first across the whole set, and it is readable, so the
+    // walk stops there — the same company the host's replay would bind to.
+    expect(host.configGetCalls).toEqual(["a-company"]);
+    expect(getRuntimeConfigState().companyId).toBe("a-company");
+    expect(getConfig().defaultAgent).toBe("codex");
+  });
+
+  it("pages until a short page, then probes in global order", async () => {
+    const host = createHost({
+      // 150 companies: two full pages plus a short one.
+      companies: [
+        ...Array.from({ length: 149 }, (_, i) => ({
+          id: `m-company-${String(i).padStart(3, "0")}`,
+        })),
+        { id: "a-company" },
+      ],
+      configs: { "a-company": { defaultAgent: "codex" } },
+    });
+
+    await definition.setup(host.ctx);
+
+    expect(host.listCalls).toEqual([
+      { limit: 100, offset: 0 },
+      { limit: 100, offset: 100 },
+    ]);
+    expect(host.configGetCalls).toEqual(["a-company"]);
+    expect(getRuntimeConfigState().companyId).toBe("a-company");
+  });
+
+  it("bounds how many companies it probes when none is readable", async () => {
     const host = createHost({
       companies: Array.from({ length: 60 }, (_, i) => ({
         id: `company-${String(i).padStart(3, "0")}`,
@@ -365,12 +429,50 @@ describe("walk ownership matches the host's replay order", () => {
 
     await definition.setup(host.ctx);
 
-    // A host with no limit returns every company, so the bound has to come from
-    // the request: startup cost must not scale with tenant count.
-    expect(host.listCalls).toEqual([{ limit: 25, offset: 0 }]);
+    // Probing a prefix of the globally sorted set can never pick the wrong
+    // owner — it stops at the first readable config — so the probe count stays
+    // bounded even though the listing enumerates everything.
     expect(host.configGetCalls).toHaveLength(25);
     expect(host.configGetCalls[0]).toBe("company-000");
     expect(host.configGetCalls[24]).toBe("company-024");
+    expect(getRuntimeConfigState().bootstrapped).toBe(false);
+  });
+
+  it("gives up ownership selection when the tenant count is past the ceiling", async () => {
+    const host = createHost({
+      companies: Array.from({ length: 1101 }, (_, i) => ({
+        id: `company-${String(i).padStart(5, "0")}`,
+      })),
+    });
+
+    await definition.setup(host.ctx);
+
+    // No owner may be chosen from a set that was never fully established.
+    expect(host.configGetCalls).toEqual([]);
+    expect(getRuntimeConfigState().bootstrapped).toBe(false);
+    expect(host.warnings.some((w) => w.message.includes("Too many companies"))).toBe(true);
+
+    // The delivery path still bootstraps it.
+    await definition.onConfigChanged!({ defaultAgent: "codex" }, { companyId: "company-00042" });
+    expect(getRuntimeConfigState().companyId).toBe("company-00042");
+  });
+
+  it("does not select an owner when the listing fails part-way through", async () => {
+    let calls = 0;
+    const host = createHost({
+      companies: () => {
+        // The first page succeeds, the second fails: the set is incomplete.
+        if (calls++ === 0) return undefined as never;
+        throw new Error("transient listing failure");
+      },
+      configs: { "company-000": { defaultAgent: "codex" } },
+    });
+
+    await definition.setup(host.ctx);
+
+    expect(host.configGetCalls).toEqual([]);
+    expect(getRuntimeConfigState().bootstrapped).toBe(false);
+    expect(getRuntimeConfigState().lastCompanyListingError).toContain("transient listing failure");
   });
 
   it("stops at the first company with a readable config", async () => {

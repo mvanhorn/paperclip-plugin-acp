@@ -175,27 +175,92 @@ async function bootstrapFromInvocation(
   }
 }
 
-/**
- * How many companies the startup walk will look at. The walk is a convenience,
- * not a contract: the host delivers configuration through `onConfigChanged`
- * regardless. `companies.list()` returns *every* company when no limit is given
- * (`applyWindow` in the host's plugin-host-services), so an unbounded walk would
- * make startup cost proportional to tenant count for no added value.
- */
-const WALK_COMPANY_LIMIT = 25;
+/** Page size for enumerating companies. */
+const COMPANY_PAGE_SIZE = 100;
 
 /**
- * Best-effort startup walk: list the companies visible to the plugin and adopt
- * the configuration of the first one whose config row resolves.
+ * Hard ceiling on companies enumerated for ownership selection. Past this the
+ * walk gives up selecting an owner entirely rather than guessing from a partial
+ * set — the host still delivers configuration through `onConfigChanged`.
+ */
+const MAX_WALK_COMPANIES = 1000;
+
+/**
+ * How many companies the walk will probe with `config.get`, in globally sorted
+ * order. Capping the probes cannot pick the wrong owner: the walk stops at the
+ * first company whose config is readable, so with a true prefix of the globally
+ * sorted set that company is exactly the one the host's replay would bind to.
+ * Exhausting the cap simply means no owner is chosen here and the delivery path
+ * takes over — a missed early bootstrap, never a divergent one.
+ */
+const MAX_WALK_PROBES = 25;
+
+/**
+ * Enumerate the COMPLETE set of company ids visible to the plugin.
  *
- * Companies are walked in ascending `companyId` order, deliberately matching
- * the order the host replays stored configs in (`listConfigs` is
- * `orderBy(asc(pluginConfig.companyId))` in the host's plugin-registry, and the
- * SDK's own single-tenant guard binds to the first company it replays).
- * `companies.list()` itself has no `ORDER BY`, so walking it in host-returned
- * order could make this plugin own one company while the SDK owns another —
- * after which the SDK rejects saves for our company before they ever reach the
- * hook, and the saves that do reach it are ignored as a second company's.
+ * Returns null when the set cannot be established — a listing error or a tenant
+ * count past the ceiling. A partial set is never returned: ownership must not be
+ * chosen from an arbitrary subset (see `runStartupConfigWalk`).
+ */
+async function listAllCompanyIds(ctx: PluginContext): Promise<string[] | null> {
+  const ids = new Set<string>();
+
+  for (let offset = 0; ; offset += COMPANY_PAGE_SIZE) {
+    let page: Array<{ id: string }>;
+    try {
+      page = (await ctx.companies.list({
+        limit: COMPANY_PAGE_SIZE,
+        offset,
+      })) as Array<{ id: string }>;
+    } catch (err) {
+      // Recorded apart from config errors: a denied listing is not the host
+      // refusing our configuration, and must not degrade health.
+      const message = recordCompanyListingError(err);
+      ctx.logger.info("Startup config walk could not list companies", { offset, error: message });
+      return null;
+    }
+
+    for (const company of page) {
+      if (typeof company?.id === "string" && company.id.length > 0) ids.add(company.id);
+    }
+
+    // A short page ends the enumeration. A page larger than we asked for means
+    // the host ignored the window and returned everything, which is also the
+    // complete set.
+    if (page.length < COMPANY_PAGE_SIZE || page.length > COMPANY_PAGE_SIZE) break;
+
+    if (ids.size > MAX_WALK_COMPANIES) {
+      ctx.logger.warn(
+        "Too many companies to establish a startup configuration owner — skipping the walk; " +
+          "the runtime starts when the host delivers configuration",
+        { companiesSeen: ids.size, maxCompanies: MAX_WALK_COMPANIES },
+      );
+      return null;
+    }
+  }
+
+  return [...ids];
+}
+
+/**
+ * Best-effort startup walk: find the company whose configuration this worker
+ * should adopt, and adopt it.
+ *
+ * The company must be the one the host would pick, because the SDK keeps its own
+ * single-tenant guard: it binds to the first company the host replays, and the
+ * host replays stored configs sorted by `companyId`
+ * (`orderBy(asc(pluginConfig.companyId))` in its plugin-registry). If this
+ * plugin bound to a different company, the SDK would reject our company's saves
+ * before they reached the hook while the saves that did arrive would be ignored
+ * as a second company's — the runtime would then be unreachable from both sides.
+ *
+ * `companies.list()` has no ordering contract and is paginated by the caller, so
+ * neither the host's page order nor any single page can establish that owner:
+ * the globally lowest configured company can sit in any page. The walk therefore
+ * enumerates every company first, sorts the complete set by id in byte order
+ * (matching the host's sort — not `localeCompare`, whose collation would
+ * diverge), and only then probes for a readable config. If the complete set
+ * cannot be established, no owner is chosen at all.
  *
  * On hosts >= v2026.817.0 the host seeds proactive company scopes from stored
  * config rows, so this succeeds at worker boot. On v2026.720.0 / v2026.722.0
@@ -206,34 +271,19 @@ const WALK_COMPANY_LIMIT = 25;
 export async function runStartupConfigWalk(ctx: PluginContext): Promise<boolean> {
   if (isBootstrapped()) return true;
 
-  let companies: Array<{ id: string }> = [];
-  try {
-    companies = (await ctx.companies.list({
-      limit: WALK_COMPANY_LIMIT,
-      offset: 0,
-    })) as Array<{ id: string }>;
-  } catch (err) {
-    // Recorded apart from config errors: a denied listing is not the host
-    // refusing our configuration, and must not degrade health.
-    const message = recordCompanyListingError(err);
-    ctx.logger.info("Startup config walk could not list companies", { error: message });
-    return false;
-  }
+  const companyIds = await listAllCompanyIds(ctx);
+  if (companyIds === null) return false;
 
-  // Byte-order comparison, matching the host's ascending companyId sort — not
-  // localeCompare, whose collation would diverge from it.
-  const ordered = [...companies]
-    .filter((company) => typeof company?.id === "string" && company.id.length > 0)
-    .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
-    .slice(0, WALK_COMPANY_LIMIT);
+  const ordered = companyIds.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  const probes = ordered.slice(0, MAX_WALK_PROBES);
 
-  for (const company of ordered) {
+  for (const companyId of probes) {
     const expectedSequence = getConfigSequence();
     try {
-      const raw = await ctx.config.get(company.id);
+      const raw = await ctx.config.get(companyId);
       if (
         adoptConfig(ctx, raw, {
-          companyId: company.id,
+          companyId,
           source: "startup-walk",
           expectedSequence,
         })
@@ -245,7 +295,7 @@ export async function runStartupConfigWalk(ctx: PluginContext): Promise<boolean>
     } catch (err) {
       const message = recordBootstrapError(err);
       ctx.logger.debug("Startup config walk: config read denied", {
-        companyId: company.id,
+        companyId,
         error: message,
       });
     }
@@ -253,7 +303,7 @@ export async function runStartupConfigWalk(ctx: PluginContext): Promise<boolean>
 
   ctx.logger.info(
     "Startup config walk found no readable company config — running on defaults until the host delivers one",
-    { companiesSeen: ordered.length, walkLimit: WALK_COMPANY_LIMIT },
+    { companiesSeen: ordered.length, companiesProbed: probes.length },
   );
   return false;
 }
