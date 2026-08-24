@@ -6,6 +6,7 @@ import {
   resetRuntimeConfig,
 } from "../src/runtime-config.js";
 import { DEFAULT_CONFIG, ORCHESTRATION_DEFAULTS } from "../src/constants.js";
+import { createSession, getSession } from "../src/session-manager.js";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 
 /**
@@ -14,13 +15,12 @@ import type { PluginContext } from "@paperclipai/plugin-sdk";
  * Since Paperclip v2026.720.0 the SDK requires a company scope for
  * `config.get`. `setup()` runs outside any invocation, so the worker must never
  * read config unscoped, must always finish registering its handlers, and must
- * adopt a company's configuration later — from the startup walk, from an
- * `onConfigChanged` delivery, or from the first company-scoped invocation.
+ * adopt a company's configuration later, when the host delivers it through
+ * `onConfigChanged`.
  *
- * Configuration arrives from two places only: an `onConfigChanged` delivery
- * (the host replays stored configuration at worker start on >= v2026.817.0 and
- * delivers every save) and a company-scoped invocation when nothing has been
- * adopted yet. `setup()` reads no configuration at all.
+ * Configuration arrives from ONE place: an `onConfigChanged` delivery — the
+ * host replays stored configuration at worker start on >= v2026.817.0 and
+ * delivers every save. Neither `setup()` nor any invocation ever reads config.
  */
 
 const SCOPE_DENIED =
@@ -176,20 +176,20 @@ describe("host matrix: v2026.720.0 / v2026.722.0 (every config read denied)", ()
     expect(getConfig().defaultAgent).toBe(DEFAULT_CONFIG.defaultAgent);
   });
 
-  it("is healthy on defaults, and degrades only once the host refuses a read", async () => {
+  it("is healthy on defaults, before and after traffic arrives", async () => {
     const host = createHost();
     await definition.setup(host.ctx);
 
-    // Nothing was asked of the host yet, so there is nothing to report.
     const atBoot = await definition.onHealth!();
     expect(atBoot.status).toBe("ok");
-    expect(atBoot.message).toBeUndefined();
     expect(atBoot.details?.configSource).toBe("defaults");
     expect(atBoot.details?.configBootstrapped).toBe(false);
 
-    // A company-scoped invocation tries to read, and this host denies it.
+    // An invocation arrives before any configuration has been delivered. It is
+    // served on defaults — every field is tuning — and reads nothing.
     const handler = host.listeners.get("plugin.paperclip-plugin-telegram.acp-spawn")![0];
     await handler({
+      companyId: "company-1",
       payload: {
         agentName: "not-a-real-agent",
         chatId: "chat-1",
@@ -198,9 +198,10 @@ describe("host matrix: v2026.720.0 / v2026.722.0 (every config read denied)", ()
       },
     });
 
-    const afterDenial = await definition.onHealth!();
-    expect(afterDenial.status).toBe("degraded");
-    expect(afterDenial.message).toContain("company context is required");
+    expect(host.configGetCalls).toEqual([]);
+    const afterTraffic = await definition.onHealth!();
+    expect(afterTraffic.status).toBe("ok");
+    expect(afterTraffic.details?.configSource).toBe("defaults");
   });
 
   it("bootstraps from an onConfigChanged delivery without a worker restart", async () => {
@@ -222,28 +223,23 @@ describe("host matrix: v2026.720.0 / v2026.722.0 (every config read denied)", ()
     expect(state.bootstrapped).toBe(true);
     expect(state.companyId).toBe("company-1");
     expect(state.source).toBe("config-changed");
-    expect(state.lastBootstrapError).toBeNull();
 
     const health = await definition.onHealth!();
     expect(health.status).toBe("ok");
     expect(health.details?.configSource).toBe("company:company-1");
   });
 
-  it("adopts config from the first company-scoped invocation", async () => {
-    // The walk finds nothing readable, then traffic arrives for a company whose
-    // config the host will serve under an invocation scope.
-    const configs: Record<string, Record<string, unknown>> = {};
-    const host = createHost({ configs });
+  it("never reads configuration from an invocation", async () => {
+    // A successful scoped `config.get` does not move the SDK's own owner — only
+    // a delivery does — so adopting from an invocation would split the two.
+    // The plugin therefore never reads config outside a delivery at all.
+    const host = createHost({ configs: { "company-1": { defaultAgent: "gemini" } } });
     await definition.setup(host.ctx);
-    expect(getRuntimeConfigState().bootstrapped).toBe(false);
-
-    configs["company-1"] = { defaultAgent: "gemini" };
 
     const handler = host.listeners.get("plugin.paperclip-plugin-telegram.acp-spawn")![0];
     await handler({
+      companyId: "company-1",
       payload: {
-        // Unknown agent: handleSpawn rejects it right after the bootstrap hook,
-        // so no subprocess is ever spawned.
         agentName: "not-a-real-agent",
         chatId: "chat-1",
         threadId: "thread-1",
@@ -251,29 +247,29 @@ describe("host matrix: v2026.720.0 / v2026.722.0 (every config read denied)", ()
       },
     });
 
-    const state = getRuntimeConfigState();
-    expect(state.bootstrapped).toBe(true);
-    expect(state.companyId).toBe("company-1");
-    expect(state.source).toBe("invocation");
-    expect(getConfig().defaultAgent).toBe("gemini");
+    expect(host.configGetCalls).toEqual([]);
+    expect(getRuntimeConfigState().bootstrapped).toBe(false);
+    expect(getRuntimeConfigState().configSource).toBe("defaults");
+    expect(getConfig().defaultAgent).toBe(DEFAULT_CONFIG.defaultAgent);
   });
 });
 
-describe("a slow config read never overwrites a newer save", () => {
-  it("drops an invocation read that resolves after a delivery", async () => {
-    let release!: (config: Record<string, unknown>) => void;
-    const pending = new Promise<Record<string, unknown>>((resolve) => {
-      release = resolve;
-    });
-
-    const host = createHost({
-      configGet: () => pending,
-    });
+describe("an invocation racing a delivery", () => {
+  it("does no work for a company the delivery made a non-owner", async () => {
+    // The race the old invocation-bootstrap had: company A's invocation was in
+    // flight, company B's delivery won, and A's handler carried on under B's
+    // runtime. With no adoption path there is nothing to lose the race with —
+    // the gate is synchronous, so a delivery either lands before it (A refused,
+    // zero work) or after the handler already holds its own config snapshot.
+    const host = createHost();
     await definition.setup(host.ctx);
 
-    // A company-scoped invocation starts reading config.
+    await definition.onConfigChanged!({ defaultAgent: "gemini" }, { companyId: "company-b" });
+
+    const emittedBefore = host.emitted.length;
     const handler = host.listeners.get("plugin.paperclip-plugin-telegram.acp-spawn")![0];
-    const dispatch = handler({
+    await handler({
+      companyId: "company-a",
       payload: {
         agentName: "not-a-real-agent",
         chatId: "chat-1",
@@ -281,18 +277,11 @@ describe("a slow config read never overwrites a newer save", () => {
         companyId: "company-a",
       },
     });
-    await new Promise((resolve) => setImmediate(resolve));
 
-    // The operator saves while that read is still in flight.
-    await definition.onConfigChanged!({ defaultAgent: "codex" }, { companyId: "company-a" });
-    expect(getConfig().defaultAgent).toBe("codex");
-
-    // The in-flight read now resolves with the older snapshot.
-    release({ defaultAgent: "gemini" });
-    await dispatch;
-
-    expect(getConfig().defaultAgent).toBe("codex");
-    expect(getRuntimeConfigState().source).toBe("config-changed");
+    // Zero work for the loser, and no read under its scope.
+    expect(host.emitted).toHaveLength(emittedBefore);
+    expect(host.configGetCalls).toEqual([]);
+    expect(getRuntimeConfigState().companyId).toBe("company-b");
   });
 });
 
@@ -426,6 +415,7 @@ describe("invocations for another company are refused", () => {
 
     const handler = host.listeners.get("plugin.paperclip-plugin-telegram.acp-spawn")![0];
     await handler({
+      companyId: "company-b",
       payload: {
         agentName: "claude",
         chatId: "chat-1",
@@ -443,6 +433,65 @@ describe("invocations for another company are refused", () => {
     expect(
       host.warnings.some((w) => w.message.includes("does not serve")),
     ).toBe(true);
+  });
+
+  it("judges an event by the host envelope, not the payload", async () => {
+    // The envelope is minted by the host; payload fields are written by the
+    // emitting plugin and cannot be trusted to name the company.
+    const host = createHost();
+    await definition.setup(host.ctx);
+    await definition.onConfigChanged!({ defaultAgent: "codex" }, { companyId: "company-a" });
+
+    const emittedBefore = host.emitted.length;
+    const handler = host.listeners.get("plugin.paperclip-plugin-telegram.acp-spawn")![0];
+    await handler({
+      // A non-owner envelope with the owner's id in the payload must not pass.
+      companyId: "company-b",
+      payload: {
+        agentName: "claude",
+        chatId: "chat-1",
+        threadId: "thread-1",
+        companyId: "company-a",
+      },
+    });
+
+    expect(host.emitted).toHaveLength(emittedBefore);
+    expect(host.stateWrites).toEqual([]);
+  });
+
+  it("refuses every session tool for a non-owner company", async () => {
+    const host = createHost();
+    await definition.setup(host.ctx);
+    await definition.onConfigChanged!({ defaultAgent: "codex" }, { companyId: "company-a" });
+
+    // The owner has a live session; another company must not be able to read,
+    // signal, close or disclose it through any tool.
+    const session = await createSession(host.ctx, {
+      sessionId: "owner-session",
+      agentId: "claude",
+      mode: "persistent",
+      cwd: "/workspace",
+    });
+    const writesAfterSetup = host.stateWrites.length;
+
+    for (const [tool, params] of [
+      ["acp_status", {}],
+      ["acp_send", { sessionId: session.sessionId, text: "hello" }],
+      ["acp_cancel", { sessionId: session.sessionId }],
+      ["acp_close", { sessionId: session.sessionId }],
+      ["acp_result", { sessionId: session.sessionId }],
+      ["acp_attach", { issueId: "i1", filename: "f.txt", content: "eA==" }],
+      ["acp_attachments", { issueId: "i1" }],
+    ] as Array<[string, Record<string, unknown>]>) {
+      const result = (await host.tools.get(tool)!(params, { companyId: "company-b" })) as {
+        error?: string;
+      };
+      expect(result.error, `${tool} was not refused`).toContain("different company");
+    }
+
+    // The owner's session is untouched.
+    expect(host.stateWrites).toHaveLength(writesAfterSetup);
+    expect((await getSession(host.ctx, session.sessionId))!.state).toBe("spawning");
   });
 
   it("refuses a non-owner tool call with an error result", async () => {

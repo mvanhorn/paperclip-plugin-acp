@@ -47,8 +47,6 @@ export type RuntimeConfigState = {
   source: ConfigSource;
   /** Human-readable provenance, e.g. `company:8f2c-…` — safe for health output. */
   configSource: string;
-  /** Last host error seen while trying to READ CONFIG, truncated. Never a secret. */
-  lastBootstrapError: string | null;
   /**
    * Monotonic counter, incremented on every adoption. Callers that await a host
    * read capture it beforehand and pass it back as `expectedSequence`, so a slow
@@ -88,9 +86,6 @@ export type ApplyConfigResult = {
   /** The company that owns the active config after this call. */
   companyId: string | null;
 };
-
-/** Maximum length of a host error message kept for health output. */
-const MAX_ERROR_LENGTH = 240;
 
 const BASE_CONFIG: AcpConfig = {
   ...ORCHESTRATION_DEFAULTS,
@@ -132,7 +127,6 @@ let current: AcpConfig = defaultConfig();
 let bootstrapped = false;
 let activeCompanyId: string | null = null;
 let source: ConfigSource = "defaults";
-let lastBootstrapError: string | null = null;
 let sequence = 0;
 /**
  * The raw configuration exactly as the host last delivered it. Ownership
@@ -153,7 +147,6 @@ export function getRuntimeConfigState(): RuntimeConfigState {
     companyId: activeCompanyId,
     source,
     configSource: describeSource(),
-    lastBootstrapError,
     sequence,
   };
 }
@@ -180,23 +173,6 @@ export function isBootstrapped(): boolean {
 /** The company whose config is active, if any. */
 export function getActiveCompanyId(): string | null {
   return activeCompanyId;
-}
-
-/**
- * Record a host error encountered while reading config. The message is
- * truncated and stored verbatim so operators see the real host reason
- * (e.g. `company context is required`) in the health payload.
- */
-export function recordBootstrapError(err: unknown): string {
-  lastBootstrapError = truncate(err);
-  return lastBootstrapError;
-}
-
-function truncate(err: unknown): string {
-  const message = err instanceof Error ? err.message : String(err);
-  return message.length > MAX_ERROR_LENGTH
-    ? `${message.slice(0, MAX_ERROR_LENGTH)}…`
-    : message;
 }
 
 /**
@@ -262,7 +238,6 @@ export function applyCompanyConfig(
   source = opts.source;
   if (opts.companyId !== null) activeCompanyId = opts.companyId;
   lastRawConfig = raw;
-  lastBootstrapError = null;
   sequence += 1;
 
   return {
@@ -303,7 +278,6 @@ export function resetRuntimeConfig(): void {
   bootstrapped = false;
   activeCompanyId = null;
   source = "defaults";
-  lastBootstrapError = null;
   lastRawConfig = undefined;
   sequence = 0;
 }

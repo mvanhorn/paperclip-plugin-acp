@@ -55,10 +55,8 @@ import {
   applyCompanyConfig,
   getActiveCompanyId,
   getConfig,
-  getConfigSequence,
   getRuntimeConfigState,
   isBootstrapped,
-  recordBootstrapError,
   type ConfigSource,
 } from "./runtime-config.js";
 import {
@@ -181,46 +179,57 @@ function logNonOwnerOnce(ctx: PluginContext, companyId: string, ownerId: string)
 }
 
 /**
- * Decide whether a company-scoped invocation may run, adopting configuration
- * from it when nothing has been adopted yet.
+ * Decide whether a company-scoped invocation may run.
  *
- * Returns false for a company other than the one this worker serves. That
- * refusal is terminal and happens before any host read or state change: reading
- * another company's configuration under this invocation's scope would be denied
- * anyway, and starting work for it would attribute one company's sessions to
- * another. Never throws — a denied read leaves the worker on defaults.
+ * An invocation NEVER reads or adopts configuration. A successful scoped
+ * `config.get` does not move the SDK's own `configCompanyId` — only a delivery
+ * through `handleConfigChanged` does — so adopting from an invocation would make
+ * the plugin own a company the SDK does not, after which the SDK accepts
+ * deliveries the plugin refuses and vice versa. On a fresh Paperclip
+ * >= v2026.817.0 install this is reachable with an empty read: the host returns
+ * `{}` for a company with no stored row, which would be adopted as ownership of
+ * nothing. Configuration ownership therefore comes from deliveries alone.
+ *
+ * Before any delivery has landed there is no owner, so every invocation is
+ * admitted and runs on the built-in defaults. That is safe for this plugin
+ * specifically: every configuration field is tuning (agent list, timeouts,
+ * concurrency), there is no credential and no per-company data in it, so a
+ * session started on defaults is correct work, merely untuned. Once an owner
+ * exists, another company's invocation is refused outright.
+ *
+ * Synchronous by construction: the decision and the dispatch that follows it
+ * cannot be separated by an await, so a delivery cannot land in between and
+ * leave a refused invocation running.
  */
-async function admitInvocation(
+function admitInvocation(
   ctx: PluginContext,
   companyId: string | null | undefined,
-): Promise<boolean> {
+): boolean {
   // Nothing to attribute: let the invocation run as it always has.
   if (!companyId) return true;
+  if (!isBootstrapped()) return true;
 
-  if (isBootstrapped()) {
-    const owner = getActiveCompanyId();
-    // A null owner means the host delivered config without a scope (pre-817
-    // SDKs), so the invocation cannot be judged against it.
-    if (owner === null || owner === companyId) return true;
-    logNonOwnerOnce(ctx, companyId, owner);
-    return false;
-  }
+  const owner = getActiveCompanyId();
+  // A null owner means the host delivered config without a scope (pre-817
+  // SDKs), so the invocation cannot be judged against it.
+  if (owner === null || owner === companyId) return true;
 
-  // Captured before the await: if a save lands while this read is in flight the
-  // sequence moves on and the stale snapshot is dropped rather than applied.
-  const expectedSequence = getConfigSequence();
-  try {
-    const raw = await ctx.config.get(companyId);
-    adoptConfig(ctx, raw, { companyId, source: "invocation", expectedSequence });
-  } catch (err) {
-    const message = recordBootstrapError(err);
-    ctx.logger.debug("Company-scoped config read failed during invocation", {
-      companyId,
-      error: message,
-    });
-  }
-  return true;
+  logNonOwnerOnce(ctx, companyId, owner);
+  return false;
 }
+
+/**
+ * The company that owns an event, taken from the envelope the host mints.
+ * Payload fields are written by the emitting plugin and are not authoritative.
+ */
+function eventCompanyId(rawEvent: { companyId?: string }): string | undefined {
+  return rawEvent.companyId;
+}
+
+/** The result every tool returns for a company this worker does not serve. */
+const WRONG_COMPANY: ToolResult = {
+  error: "This ACP runtime serves a different company.",
+};
 
 // --- Session idle/max-age reaper --------------------------------------------
 // The manifest advertises sessionIdleTimeoutMs and sessionMaxAgeMs, but without
@@ -312,8 +321,8 @@ const plugin = definePlugin({
     // company scope, and `setup()` runs outside any invocation, so an unscoped
     // read throws and would take down the whole worker before a single handler
     // is registered. Registration runs first on safe defaults; configuration is
-    // adopted afterwards (startup walk / onConfigChanged / first invocation) and
-    // every handler below reads it at dispatch time via `getConfig()`.
+    // adopted when the host delivers it through `onConfigChanged`, and every
+    // handler below reads it at dispatch time via `getConfig()`.
     ctx.logger.info("ACP plugin loading on built-in defaults", {
       enabledAgents: getConfig().enabledAgents,
     });
@@ -331,8 +340,8 @@ const plugin = definePlugin({
       ctx.events.on(
         `plugin.${platformPlugin}.acp-spawn` as `plugin.${string}`,
         async (rawEvent) => {
+          if (!admitInvocation(ctx, eventCompanyId(rawEvent))) return;
           const event = rawEvent.payload as unknown as AcpSpawnEvent;
-          if (!(await admitInvocation(ctx, event.companyId))) return;
           await handleSpawn(ctx, getConfig(), currentEnabledAgents(), event, platformPlugin);
         },
       );
@@ -341,6 +350,7 @@ const plugin = definePlugin({
       ctx.events.on(
         `plugin.${platformPlugin}.acp-message` as `plugin.${string}`,
         async (rawEvent) => {
+          if (!admitInvocation(ctx, eventCompanyId(rawEvent))) return;
           const event = rawEvent.payload as unknown as AcpMessageCrossEvent;
           await handleMessage(ctx, event);
         },
@@ -350,6 +360,7 @@ const plugin = definePlugin({
       ctx.events.on(
         `plugin.${platformPlugin}.acp-cancel` as `plugin.${string}`,
         async (rawEvent) => {
+          if (!admitInvocation(ctx, eventCompanyId(rawEvent))) return;
           const event = rawEvent.payload as unknown as AcpCancelEvent;
           handleCancel(event);
         },
@@ -359,6 +370,7 @@ const plugin = definePlugin({
       ctx.events.on(
         `plugin.${platformPlugin}.acp-close` as `plugin.${string}`,
         async (rawEvent) => {
+          if (!admitInvocation(ctx, eventCompanyId(rawEvent))) return;
           const event = rawEvent.payload as unknown as AcpCloseEvent;
           await handleClose(ctx, event);
         },
@@ -375,9 +387,9 @@ const plugin = definePlugin({
     ctx.events.on(
       WEBHOOK_EVENTS.issueStatusChange as `plugin.${string}`,
       async (rawEvent) => {
+        if (!admitInvocation(ctx, eventCompanyId(rawEvent))) return;
         const event = rawEvent.payload as unknown as IssueStatusChangeEvent;
         try {
-          if (!(await admitInvocation(ctx, event.companyId))) return;
           await onIssueStatusChange(ctx, getConfig(), event);
         } catch (err) {
           ctx.logger.error("Webhook hook on_issue_status_change failed", {
@@ -391,9 +403,9 @@ const plugin = definePlugin({
     ctx.events.on(
       WEBHOOK_EVENTS.sessionComplete as `plugin.${string}`,
       async (rawEvent) => {
+        if (!admitInvocation(ctx, eventCompanyId(rawEvent))) return;
         const event = rawEvent.payload as unknown as SessionCompleteEvent;
         try {
-          if (!(await admitInvocation(ctx, event.companyId))) return;
           await onSessionComplete(ctx, event, getConfig());
         } catch (err) {
           ctx.logger.error("Webhook hook on_session_complete failed", {
@@ -407,9 +419,9 @@ const plugin = definePlugin({
     ctx.events.on(
       WEBHOOK_EVENTS.approvalRequired as `plugin.${string}`,
       async (rawEvent) => {
+        if (!admitInvocation(ctx, eventCompanyId(rawEvent))) return;
         const event = rawEvent.payload as unknown as ApprovalRequiredEvent;
         try {
-          if (!(await admitInvocation(ctx, event.companyId))) return;
           await onApprovalRequired(ctx, event);
         } catch (err) {
           ctx.logger.error("Webhook hook on_approval_required failed", {
@@ -442,9 +454,7 @@ const plugin = definePlugin({
         },
       },
       async (params: unknown, runCtx: ToolRunContext): Promise<ToolResult> => {
-        if (!(await admitInvocation(ctx, runCtx.companyId))) {
-          return { error: "This ACP runtime serves a different company." };
-        }
+        if (!admitInvocation(ctx, runCtx.companyId)) return WRONG_COMPANY;
         const config = getConfig();
         const enabledAgents = currentEnabledAgents();
         const p = params as Record<string, unknown>;
@@ -504,7 +514,8 @@ const plugin = definePlugin({
         description: "List active ACP sessions and their state.",
         parametersSchema: { type: "object", properties: {} },
       },
-      async (_params: unknown, _runCtx: ToolRunContext): Promise<ToolResult> => {
+      async (_params: unknown, runCtx: ToolRunContext): Promise<ToolResult> => {
+        if (!admitInvocation(ctx, runCtx.companyId)) return WRONG_COMPANY;
         const activeIds = getActiveSessionIds();
         const sessions = [];
 
@@ -544,7 +555,8 @@ const plugin = definePlugin({
           required: ["sessionId", "text"],
         },
       },
-      async (params: unknown, _runCtx: ToolRunContext): Promise<ToolResult> => {
+      async (params: unknown, runCtx: ToolRunContext): Promise<ToolResult> => {
+        if (!admitInvocation(ctx, runCtx.companyId)) return WRONG_COMPANY;
         const p = params as Record<string, unknown>;
         const sessionId = p.sessionId as string;
         const text = p.text as string;
@@ -571,7 +583,8 @@ const plugin = definePlugin({
           required: ["sessionId"],
         },
       },
-      async (params: unknown, _runCtx: ToolRunContext): Promise<ToolResult> => {
+      async (params: unknown, runCtx: ToolRunContext): Promise<ToolResult> => {
+        if (!admitInvocation(ctx, runCtx.companyId)) return WRONG_COMPANY;
         const p = params as Record<string, unknown>;
         const sessionId = p.sessionId as string;
         const cancelled = cancelSession(sessionId);
@@ -592,7 +605,8 @@ const plugin = definePlugin({
           required: ["sessionId"],
         },
       },
-      async (params: unknown, _runCtx: ToolRunContext): Promise<ToolResult> => {
+      async (params: unknown, runCtx: ToolRunContext): Promise<ToolResult> => {
+        if (!admitInvocation(ctx, runCtx.companyId)) return WRONG_COMPANY;
         const p = params as Record<string, unknown>;
         const sessionId = p.sessionId as string;
         killSession(sessionId);
@@ -618,7 +632,8 @@ const plugin = definePlugin({
           required: ["sessionId"],
         },
       },
-      async (params: unknown, _runCtx: ToolRunContext): Promise<ToolResult> => {
+      async (params: unknown, runCtx: ToolRunContext): Promise<ToolResult> => {
+        if (!admitInvocation(ctx, runCtx.companyId)) return WRONG_COMPANY;
         const p = params as Record<string, unknown>;
         const sessionId = p.sessionId as string;
         if (!sessionId) return { error: "sessionId is required" };
@@ -655,7 +670,8 @@ const plugin = definePlugin({
           required: ["issueId", "filename", "content"],
         },
       },
-      async (params: unknown, _runCtx: ToolRunContext): Promise<ToolResult> => {
+      async (params: unknown, runCtx: ToolRunContext): Promise<ToolResult> => {
+        if (!admitInvocation(ctx, runCtx.companyId)) return WRONG_COMPANY;
         const p = params as Record<string, unknown>;
         const issueId = p.issueId as string;
         const filename = p.filename as string;
@@ -700,7 +716,8 @@ const plugin = definePlugin({
           required: ["issueId"],
         },
       },
-      async (params: unknown, _runCtx: ToolRunContext): Promise<ToolResult> => {
+      async (params: unknown, runCtx: ToolRunContext): Promise<ToolResult> => {
+        if (!admitInvocation(ctx, runCtx.companyId)) return WRONG_COMPANY;
         const p = params as Record<string, unknown>;
         const issueId = p.issueId as string;
 
@@ -816,18 +833,13 @@ const plugin = definePlugin({
     }
 
     // The ACP runtime is functional on defaults — every config field is tuning,
-    // there is no credential to resolve — so a worker without a company config
-    // is reported as `ok` with its provenance, not as broken. It degrades only
-    // when a company config was expected but the host refused to hand one over
-    // (the v2026.720.0 / v2026.722.0 gate), so operators see the real host
-    // message instead of silence, and when a circuit breaker is open.
-    const configDenied = !runtime.bootstrapped && runtime.lastBootstrapError !== null;
-
+    // there is no credential to resolve — so a worker that has not been handed a
+    // company configuration is reported as `ok` with its provenance, not as
+    // broken. The worker never reads configuration itself, so there is no read
+    // that can be refused; the only unhealthy state left is an open circuit
+    // breaker.
     return {
-      status: anyCircuitOpen || configDenied ? "degraded" : "ok",
-      message: configDenied
-        ? `Running on default configuration: ${runtime.lastBootstrapError}`
-        : undefined,
+      status: anyCircuitOpen ? "degraded" : "ok",
       details: {
         activeSessions: activeCount,
         circuitBreakers,
@@ -835,7 +847,6 @@ const plugin = definePlugin({
         configSource: runtime.configSource,
         configCompanyId: runtime.companyId,
         configBootstrapped: runtime.bootstrapped,
-        lastConfigError: runtime.lastBootstrapError,
       },
     };
   },
