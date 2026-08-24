@@ -19,7 +19,10 @@ describe("manifest metadata", () => {
     expect(manifest.id).toBe(pkg.name);
   });
 
-  it("declares companies.read for the startup config walk", () => {
-    expect(manifest.capabilities).toContain("companies.read");
+  it("declares no capability it does not use", () => {
+    // `companies.read` existed only for the startup config walk. Nothing reads
+    // company metadata any more, and an unused capability is a permission the
+    // install does not need.
+    expect(manifest.capabilities).not.toContain("companies.read");
   });
 });

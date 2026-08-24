@@ -110,41 +110,36 @@ A plugin worker starts outside any company invocation, so it cannot read its own
 configuration at startup on those hosts.
 
 This plugin is built for that: the worker always starts on its built-in
-defaults, registers its tools and event listeners, and adopts a company's
-configuration as soon as one becomes reachable — from the host's config
-delivery, from a startup walk over the companies it can see, or from the first
-company-scoped event or tool call. It never fails activation because a
-configuration is unavailable.
+defaults and registers its tools and event listeners, then adopts a company's
+configuration when the host delivers one. It never reads configuration by
+itself, and never fails activation because a configuration is unavailable.
 
 **Fully supported on Paperclip >= v2026.817.0.** Earlier hosts activate the
 plugin and accept its configuration, with the limitations below.
 
 | Paperclip version | Behaviour |
 |-------------------|-----------|
-| >= v2026.817.0 | Fully supported. The worker reads the stored configuration at boot for companies that already have one, picks up later saves without a restart, and knows which company each save belongs to. |
-| v2026.720.0 - v2026.722.0 | The plugin activates and your configuration applies when you save it, but **it is not retained across a worker restart**: these hosts start every worker with an empty config and never replay stored rows ([#10092](https://github.com/paperclipai/paperclip/pull/10092) shipped in v2026.817.0), while the same hosts refuse the worker's own scoped reads. Save the configuration again after a restart, or upgrade the host. These SDKs also call the config hook without a company scope, so a save cannot be attributed to a company and is treated as a single-tenant refresh of the running configuration — the plugin logs a warning when that replaces a config it knows a company owns. |
+| >= v2026.817.0 | Fully supported. The host replays the stored configuration to the worker at start, and delivers every later save without a restart, each with the company it belongs to. |
+| v2026.720.0 - v2026.722.0 | The plugin activates and your configuration applies when you save it, but **it is not retained across a worker restart**: these hosts start every worker with an empty config and never replay stored rows ([#10092](https://github.com/paperclipai/paperclip/pull/10092) shipped in v2026.817.0). **Save the configuration once after installing, and again after any restart.** These SDKs also call the config hook without a company scope, so a save cannot be attributed to a company and is treated as a single-tenant refresh of the running configuration — the plugin logs a warning when that replaces a config it knows a company owns. |
 | < v2026.720.0 | Unaffected; the worker runs on whatever configuration the host delivers. |
 
-Until a company configuration has been adopted, the plugin runs on the defaults
-in the table above — it is fully functional, just untuned. The plugin health
-panel shows where the active configuration came from (`configSource`) and, if
-the host refused a read, the exact host error.
+Until a company configuration has been delivered, the plugin runs on the
+defaults in the table above — it is fully functional, just untuned, and requests
+arriving in the meantime are served on those defaults. Every configuration field
+is tuning (agent list, timeouts, concurrency); there is no credential in it. The
+plugin health panel shows where the active configuration came from
+(`configSource`).
 
-#### Upgrading an existing install
-
-This version declares one additional capability, `companies.read`, used by the
-startup config walk. Paperclip treats any added capability as an escalation that
-needs approval and refuses the in-place upgrade — and current hosts stop the
-running worker *before* that check, so the plugin is left stopped and on the old
-version. Remove and reinstall the plugin instead of upgrading it, or approve the
-capability escalation if your host offers that path. A fresh install is
-unaffected.
-
-The plugin runs a **single company's configuration** per worker. The first
-company whose configuration resolves owns the runtime; a later save for that
-same company refreshes it. Companies are examined in ascending id order, the
-same order the host replays stored configurations in, so the plugin and the host
-agree on which company owns the worker. Serving several companies from one worker is a
+The plugin runs a **single company's configuration** per worker: the install
+serves the company whose configuration the host delivers first. A later save for
+that company refreshes it, and a save for a different company is refused — with
+one exception that mirrors the host's own rule, so the two always agree on who
+owns the worker: if the other company's configuration is identical to the
+running one (legacy installs duplicated a single configuration across every
+company), ownership moves to it. Every event and every tool call arriving for
+any other company is refused before any work starts — judged on the company the
+host stamps on the request — so one company's sessions can never be read,
+signalled, closed or attributed by another. Serving several companies from one worker is a
 possible follow-up, not current behaviour.
 
 ## Agent tools
@@ -179,7 +174,7 @@ pnpm test
 pnpm build
 ```
 
-247 tests covering session lifecycle, spawn/send/cancel/close flows, 1:N session support, idle timeout, max age, lazy migration, cross-plugin event routing, orchestration guards, webhook hooks, attachments, the company-scoped config host matrix, ownership ordering and in-flight config races, and error handling.
+249 tests covering session lifecycle, spawn/send/cancel/close flows, 1:N session support, idle timeout, max age, lazy migration, cross-plugin event routing, orchestration guards, webhook hooks, attachments, the company-scoped config host matrix, ownership rules and in-flight config races, and error handling.
 
 ## Contributing
 

@@ -53,12 +53,10 @@ import type {
 } from "./types.js";
 import {
   applyCompanyConfig,
+  getActiveCompanyId,
   getConfig,
-  getConfigSequence,
   getRuntimeConfigState,
   isBootstrapped,
-  recordBootstrapError,
-  recordCompanyListingError,
   type ConfigSource,
 } from "./runtime-config.js";
 import {
@@ -92,34 +90,29 @@ function currentEnabledAgents(): ReturnType<typeof parseEnabledAgents> {
 function adoptConfig(
   ctx: PluginContext,
   raw: unknown,
-  opts: {
-    companyId: string | null;
-    source: ConfigSource;
-    /** Sequence captured before an awaited host read; see `applyCompanyConfig`. */
-    expectedSequence?: number;
-  },
+  opts: { companyId: string | null; source: ConfigSource },
 ): boolean {
   const result = applyCompanyConfig(raw, opts);
 
   if (!result.applied) {
-    if (result.skippedReason === "stale-snapshot") {
-      // A newer configuration landed while our read was in flight. Dropping the
-      // older snapshot keeps the most recent save authoritative.
-      ctx.logger.info("Discarding a configuration read that resolved after a newer save", {
-        companyId: opts.companyId,
+    ctx.logger.warn(
+      "Ignoring config for a second company — this plugin runs a single company runtime",
+      {
+        runningCompanyId: result.companyId,
+        ignoredCompanyId: opts.companyId,
         source: opts.source,
-      });
-    } else {
-      ctx.logger.warn(
-        "Ignoring config for a second company — this plugin runs a single company runtime",
-        {
-          runningCompanyId: result.companyId,
-          ignoredCompanyId: opts.companyId,
-          source: opts.source,
-        },
-      );
-    }
+      },
+    );
     return false;
+  }
+
+  if (result.ownerAdvanced) {
+    // Not a tenant switch: the incoming configuration is identical to the one
+    // already running, and the SDK moved its own owner with it.
+    ctx.logger.info("Configuration ownership advanced to another company with identical config", {
+      companyId: result.companyId,
+      source: opts.source,
+    });
   }
 
   if (result.legacyUnscopedReplace) {
@@ -150,163 +143,79 @@ function adoptConfig(
   return true;
 }
 
+/** Throttle for the non-owner refusal log, keyed by company. */
+const nonOwnerLoggedAt = new Map<string, number>();
+const NON_OWNER_LOG_INTERVAL_MS = 60_000;
+
+/** Clear the non-owner log throttle. Called on shutdown, and by tests. */
+export function resetInvocationGate(): void {
+  nonOwnerLoggedAt.clear();
+}
+
+function logNonOwnerOnce(ctx: PluginContext, companyId: string, ownerId: string): void {
+  const now = Date.now();
+  const last = nonOwnerLoggedAt.get(companyId) ?? 0;
+  if (now - last < NON_OWNER_LOG_INTERVAL_MS) return;
+  nonOwnerLoggedAt.set(companyId, now);
+  ctx.logger.warn(
+    "Refusing an invocation for a company this worker does not serve — " +
+      "this plugin runs a single company runtime",
+    { requestedCompanyId: companyId, runningCompanyId: ownerId },
+  );
+}
+
 /**
- * Adopt config from the first company-scoped invocation that reaches us, for
- * hosts that never deliver `onConfigChanged` before traffic starts. Best-effort
- * and never throws — a denied read leaves the worker on defaults.
+ * Decide whether a company-scoped invocation may run.
+ *
+ * An invocation NEVER reads or adopts configuration. A successful scoped
+ * `config.get` does not move the SDK's own `configCompanyId` — only a delivery
+ * through `handleConfigChanged` does — so adopting from an invocation would make
+ * the plugin own a company the SDK does not, after which the SDK accepts
+ * deliveries the plugin refuses and vice versa. On a fresh Paperclip
+ * >= v2026.817.0 install this is reachable with an empty read: the host returns
+ * `{}` for a company with no stored row, which would be adopted as ownership of
+ * nothing. Configuration ownership therefore comes from deliveries alone.
+ *
+ * Before any delivery has landed there is no owner, so every invocation is
+ * admitted and runs on the built-in defaults. That is safe for this plugin
+ * specifically: every configuration field is tuning (agent list, timeouts,
+ * concurrency), there is no credential and no per-company data in it, so a
+ * session started on defaults is correct work, merely untuned. Once an owner
+ * exists, another company's invocation is refused outright.
+ *
+ * Synchronous by construction: the decision and the dispatch that follows it
+ * cannot be separated by an await, so a delivery cannot land in between and
+ * leave a refused invocation running.
  */
-async function bootstrapFromInvocation(
+function admitInvocation(
   ctx: PluginContext,
   companyId: string | null | undefined,
-): Promise<void> {
-  if (!companyId || isBootstrapped()) return;
-  // Captured before the await: if a save lands while this read is in flight the
-  // sequence moves on and the stale snapshot is dropped rather than applied.
-  const expectedSequence = getConfigSequence();
-  try {
-    const raw = await ctx.config.get(companyId);
-    adoptConfig(ctx, raw, { companyId, source: "invocation", expectedSequence });
-  } catch (err) {
-    const message = recordBootstrapError(err);
-    ctx.logger.debug("Company-scoped config read failed during invocation", {
-      companyId,
-      error: message,
-    });
-  }
-}
+): boolean {
+  // Nothing to attribute: let the invocation run as it always has.
+  if (!companyId) return true;
+  if (!isBootstrapped()) return true;
 
-/**
- * Hard ceiling on companies considered for ownership selection. Past this the
- * walk gives up selecting an owner entirely rather than guessing from a partial
- * set — the host still delivers configuration through `onConfigChanged`.
- */
-const MAX_WALK_COMPANIES = 1000;
+  const owner = getActiveCompanyId();
+  // A null owner means the host delivered config without a scope (pre-817
+  // SDKs), so the invocation cannot be judged against it.
+  if (owner === null || owner === companyId) return true;
 
-/**
- * How many companies the walk will probe with `config.get`, in globally sorted
- * order. Capping the probes cannot pick the wrong owner: the walk stops at the
- * first company whose config is readable, so with a true prefix of the globally
- * sorted set that company is exactly the one the host's replay would bind to.
- * Exhausting the cap simply means no owner is chosen here and the delivery path
- * takes over — a missed early bootstrap, never a divergent one.
- */
-const MAX_WALK_PROBES = 25;
-
-/**
- * Enumerate the COMPLETE set of company ids visible to the plugin, in one
- * request.
- *
- * Returns null when the set cannot be established — a listing error, or more
- * rows than the ceiling. A partial set is never returned: ownership must not be
- * chosen from an arbitrary subset (see `runStartupConfigWalk`).
- *
- * Deliberately NOT paginated. The host answers every `companies.list` call by
- * re-running an unordered query and slicing the fresh result
- * (`applyWindow(await companies.list(), params)`, over a query with no
- * `ORDER BY`), so two calls can order the rows differently: consecutive offset
- * windows may overlap, silently omit a company, and still end in a short page
- * that looks like the end of the data. Offset paging therefore cannot prove
- * completeness on this API. One request bounded at `MAX_WALK_COMPANIES + 1`
- * can: a full-size response means the ceiling was exceeded, and anything
- * smaller is the whole set as of that single query.
- */
-async function listAllCompanyIds(ctx: PluginContext): Promise<string[] | null> {
-  let rows: Array<{ id: string }>;
-  try {
-    rows = (await ctx.companies.list({
-      limit: MAX_WALK_COMPANIES + 1,
-      offset: 0,
-    })) as Array<{ id: string }>;
-  } catch (err) {
-    // Recorded apart from config errors: a denied listing is not the host
-    // refusing our configuration, and must not degrade health.
-    const message = recordCompanyListingError(err);
-    ctx.logger.info("Startup config walk could not list companies", { error: message });
-    return null;
-  }
-
-  if (rows.length > MAX_WALK_COMPANIES) {
-    ctx.logger.warn(
-      "Too many companies to establish a startup configuration owner — skipping the walk; " +
-        "the runtime starts when the host delivers configuration",
-      { companiesSeen: rows.length, maxCompanies: MAX_WALK_COMPANIES },
-    );
-    return null;
-  }
-
-  const ids = new Set<string>();
-  for (const company of rows) {
-    if (typeof company?.id === "string" && company.id.length > 0) ids.add(company.id);
-  }
-  return [...ids];
-}
-
-/**
- * Best-effort startup walk: find the company whose configuration this worker
- * should adopt, and adopt it.
- *
- * The company must be the one the host would pick, because the SDK keeps its own
- * single-tenant guard: it binds to the first company the host replays, and the
- * host replays stored configs sorted by `companyId`
- * (`orderBy(asc(pluginConfig.companyId))` in its plugin-registry). If this
- * plugin bound to a different company, the SDK would reject our company's saves
- * before they reached the hook while the saves that did arrive would be ignored
- * as a second company's — the runtime would then be unreachable from both sides.
- *
- * `companies.list()` has no ordering contract, so no page of it can establish
- * that owner — the globally lowest configured company can sit anywhere, and the
- * host re-queries unordered on every call, which makes offset paging unable to
- * prove it saw everything. The walk therefore takes ONE bounded snapshot of the
- * whole company set, sorts it by id in byte order (matching the host's sort —
- * not `localeCompare`, whose collation would diverge), and only then probes for
- * a readable config. If the complete set cannot be established, no owner is
- * chosen at all.
- *
- * On hosts >= v2026.817.0 the host seeds proactive company scopes from stored
- * config rows, so this succeeds at worker boot. On v2026.720.0 / v2026.722.0
- * every read is denied and the worker stays on defaults until the host delivers
- * config through `onConfigChanged`. On hosts that do not grant `companies.read`
- * the listing itself fails. All three paths are non-fatal by construction.
- */
-export async function runStartupConfigWalk(ctx: PluginContext): Promise<boolean> {
-  if (isBootstrapped()) return true;
-
-  const companyIds = await listAllCompanyIds(ctx);
-  if (companyIds === null) return false;
-
-  const ordered = companyIds.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
-  const probes = ordered.slice(0, MAX_WALK_PROBES);
-
-  for (const companyId of probes) {
-    const expectedSequence = getConfigSequence();
-    try {
-      const raw = await ctx.config.get(companyId);
-      if (
-        adoptConfig(ctx, raw, {
-          companyId,
-          source: "startup-walk",
-          expectedSequence,
-        })
-      ) {
-        return true;
-      }
-      // A delivery beat us to it while this read was in flight: that config wins.
-      if (isBootstrapped()) return true;
-    } catch (err) {
-      const message = recordBootstrapError(err);
-      ctx.logger.debug("Startup config walk: config read denied", {
-        companyId,
-        error: message,
-      });
-    }
-  }
-
-  ctx.logger.info(
-    "Startup config walk found no readable company config — running on defaults until the host delivers one",
-    { companiesSeen: ordered.length, companiesProbed: probes.length },
-  );
+  logNonOwnerOnce(ctx, companyId, owner);
   return false;
 }
+
+/**
+ * The company that owns an event, taken from the envelope the host mints.
+ * Payload fields are written by the emitting plugin and are not authoritative.
+ */
+function eventCompanyId(rawEvent: { companyId?: string }): string | undefined {
+  return rawEvent.companyId;
+}
+
+/** The result every tool returns for a company this worker does not serve. */
+const WRONG_COMPANY: ToolResult = {
+  error: "This ACP runtime serves a different company.",
+};
 
 // --- Session idle/max-age reaper --------------------------------------------
 // The manifest advertises sessionIdleTimeoutMs and sessionMaxAgeMs, but without
@@ -398,8 +307,8 @@ const plugin = definePlugin({
     // company scope, and `setup()` runs outside any invocation, so an unscoped
     // read throws and would take down the whole worker before a single handler
     // is registered. Registration runs first on safe defaults; configuration is
-    // adopted afterwards (startup walk / onConfigChanged / first invocation) and
-    // every handler below reads it at dispatch time via `getConfig()`.
+    // adopted when the host delivers it through `onConfigChanged`, and every
+    // handler below reads it at dispatch time via `getConfig()`.
     ctx.logger.info("ACP plugin loading on built-in defaults", {
       enabledAgents: getConfig().enabledAgents,
     });
@@ -417,8 +326,8 @@ const plugin = definePlugin({
       ctx.events.on(
         `plugin.${platformPlugin}.acp-spawn` as `plugin.${string}`,
         async (rawEvent) => {
+          if (!admitInvocation(ctx, eventCompanyId(rawEvent))) return;
           const event = rawEvent.payload as unknown as AcpSpawnEvent;
-          await bootstrapFromInvocation(ctx, event.companyId);
           await handleSpawn(ctx, getConfig(), currentEnabledAgents(), event, platformPlugin);
         },
       );
@@ -427,6 +336,7 @@ const plugin = definePlugin({
       ctx.events.on(
         `plugin.${platformPlugin}.acp-message` as `plugin.${string}`,
         async (rawEvent) => {
+          if (!admitInvocation(ctx, eventCompanyId(rawEvent))) return;
           const event = rawEvent.payload as unknown as AcpMessageCrossEvent;
           await handleMessage(ctx, event);
         },
@@ -436,6 +346,7 @@ const plugin = definePlugin({
       ctx.events.on(
         `plugin.${platformPlugin}.acp-cancel` as `plugin.${string}`,
         async (rawEvent) => {
+          if (!admitInvocation(ctx, eventCompanyId(rawEvent))) return;
           const event = rawEvent.payload as unknown as AcpCancelEvent;
           handleCancel(event);
         },
@@ -445,6 +356,7 @@ const plugin = definePlugin({
       ctx.events.on(
         `plugin.${platformPlugin}.acp-close` as `plugin.${string}`,
         async (rawEvent) => {
+          if (!admitInvocation(ctx, eventCompanyId(rawEvent))) return;
           const event = rawEvent.payload as unknown as AcpCloseEvent;
           await handleClose(ctx, event);
         },
@@ -461,9 +373,9 @@ const plugin = definePlugin({
     ctx.events.on(
       WEBHOOK_EVENTS.issueStatusChange as `plugin.${string}`,
       async (rawEvent) => {
+        if (!admitInvocation(ctx, eventCompanyId(rawEvent))) return;
         const event = rawEvent.payload as unknown as IssueStatusChangeEvent;
         try {
-          await bootstrapFromInvocation(ctx, event.companyId);
           await onIssueStatusChange(ctx, getConfig(), event);
         } catch (err) {
           ctx.logger.error("Webhook hook on_issue_status_change failed", {
@@ -477,9 +389,9 @@ const plugin = definePlugin({
     ctx.events.on(
       WEBHOOK_EVENTS.sessionComplete as `plugin.${string}`,
       async (rawEvent) => {
+        if (!admitInvocation(ctx, eventCompanyId(rawEvent))) return;
         const event = rawEvent.payload as unknown as SessionCompleteEvent;
         try {
-          await bootstrapFromInvocation(ctx, event.companyId);
           await onSessionComplete(ctx, event, getConfig());
         } catch (err) {
           ctx.logger.error("Webhook hook on_session_complete failed", {
@@ -493,9 +405,9 @@ const plugin = definePlugin({
     ctx.events.on(
       WEBHOOK_EVENTS.approvalRequired as `plugin.${string}`,
       async (rawEvent) => {
+        if (!admitInvocation(ctx, eventCompanyId(rawEvent))) return;
         const event = rawEvent.payload as unknown as ApprovalRequiredEvent;
         try {
-          await bootstrapFromInvocation(ctx, event.companyId);
           await onApprovalRequired(ctx, event);
         } catch (err) {
           ctx.logger.error("Webhook hook on_approval_required failed", {
@@ -528,7 +440,7 @@ const plugin = definePlugin({
         },
       },
       async (params: unknown, runCtx: ToolRunContext): Promise<ToolResult> => {
-        await bootstrapFromInvocation(ctx, runCtx.companyId);
+        if (!admitInvocation(ctx, runCtx.companyId)) return WRONG_COMPANY;
         const config = getConfig();
         const enabledAgents = currentEnabledAgents();
         const p = params as Record<string, unknown>;
@@ -588,7 +500,8 @@ const plugin = definePlugin({
         description: "List active ACP sessions and their state.",
         parametersSchema: { type: "object", properties: {} },
       },
-      async (_params: unknown, _runCtx: ToolRunContext): Promise<ToolResult> => {
+      async (_params: unknown, runCtx: ToolRunContext): Promise<ToolResult> => {
+        if (!admitInvocation(ctx, runCtx.companyId)) return WRONG_COMPANY;
         const activeIds = getActiveSessionIds();
         const sessions = [];
 
@@ -628,7 +541,8 @@ const plugin = definePlugin({
           required: ["sessionId", "text"],
         },
       },
-      async (params: unknown, _runCtx: ToolRunContext): Promise<ToolResult> => {
+      async (params: unknown, runCtx: ToolRunContext): Promise<ToolResult> => {
+        if (!admitInvocation(ctx, runCtx.companyId)) return WRONG_COMPANY;
         const p = params as Record<string, unknown>;
         const sessionId = p.sessionId as string;
         const text = p.text as string;
@@ -655,7 +569,8 @@ const plugin = definePlugin({
           required: ["sessionId"],
         },
       },
-      async (params: unknown, _runCtx: ToolRunContext): Promise<ToolResult> => {
+      async (params: unknown, runCtx: ToolRunContext): Promise<ToolResult> => {
+        if (!admitInvocation(ctx, runCtx.companyId)) return WRONG_COMPANY;
         const p = params as Record<string, unknown>;
         const sessionId = p.sessionId as string;
         const cancelled = cancelSession(sessionId);
@@ -676,7 +591,8 @@ const plugin = definePlugin({
           required: ["sessionId"],
         },
       },
-      async (params: unknown, _runCtx: ToolRunContext): Promise<ToolResult> => {
+      async (params: unknown, runCtx: ToolRunContext): Promise<ToolResult> => {
+        if (!admitInvocation(ctx, runCtx.companyId)) return WRONG_COMPANY;
         const p = params as Record<string, unknown>;
         const sessionId = p.sessionId as string;
         killSession(sessionId);
@@ -702,7 +618,8 @@ const plugin = definePlugin({
           required: ["sessionId"],
         },
       },
-      async (params: unknown, _runCtx: ToolRunContext): Promise<ToolResult> => {
+      async (params: unknown, runCtx: ToolRunContext): Promise<ToolResult> => {
+        if (!admitInvocation(ctx, runCtx.companyId)) return WRONG_COMPANY;
         const p = params as Record<string, unknown>;
         const sessionId = p.sessionId as string;
         if (!sessionId) return { error: "sessionId is required" };
@@ -739,7 +656,8 @@ const plugin = definePlugin({
           required: ["issueId", "filename", "content"],
         },
       },
-      async (params: unknown, _runCtx: ToolRunContext): Promise<ToolResult> => {
+      async (params: unknown, runCtx: ToolRunContext): Promise<ToolResult> => {
+        if (!admitInvocation(ctx, runCtx.companyId)) return WRONG_COMPANY;
         const p = params as Record<string, unknown>;
         const issueId = p.issueId as string;
         const filename = p.filename as string;
@@ -784,7 +702,8 @@ const plugin = definePlugin({
           required: ["issueId"],
         },
       },
-      async (params: unknown, _runCtx: ToolRunContext): Promise<ToolResult> => {
+      async (params: unknown, runCtx: ToolRunContext): Promise<ToolResult> => {
+        if (!admitInvocation(ctx, runCtx.companyId)) return WRONG_COMPANY;
         const p = params as Record<string, unknown>;
         const issueId = p.issueId as string;
 
@@ -832,6 +751,7 @@ const plugin = definePlugin({
       resetCircuitBreakers();
       resetActiveIssueSessions();
       resetRateLimitCooldown();
+      resetInvocationGate();
       ctx.logger.info("ACP plugin stopped, cleaned up sessions", {
         count: activeIds.length,
       });
@@ -842,9 +762,9 @@ const plugin = definePlugin({
       listeningTo: CHAT_PLATFORM_PLUGINS as unknown as string[],
     });
 
-    // Every handler is registered by this point, so the walk can only improve
-    // the configuration — it can never prevent the plugin from activating.
-    await runStartupConfigWalk(ctx);
+    // No configuration read here: `setup()` runs outside any company scope, and
+    // the host delivers stored configuration through `onConfigChanged` at worker
+    // start (Paperclip >= v2026.817.0) and on every save.
   },
 
   /**
@@ -899,23 +819,13 @@ const plugin = definePlugin({
     }
 
     // The ACP runtime is functional on defaults — every config field is tuning,
-    // there is no credential to resolve — so a worker without a company config
-    // is reported as `ok` with its provenance, not as broken. It degrades only
-    // when a company config was expected but the host refused to hand one over
-    // (the v2026.720.0 / v2026.722.0 gate), so operators see the real host
-    // message instead of silence, and when a circuit breaker is open.
-    //
-    // A failed `companies.list()` is NOT such a refusal: the listing is an
-    // optional convenience for the startup walk, and the host delivers config
-    // through `onConfigChanged` whether or not the plugin can enumerate
-    // companies. It is reported in the details and never in the status.
-    const configDenied = !runtime.bootstrapped && runtime.lastBootstrapError !== null;
-
+    // there is no credential to resolve — so a worker that has not been handed a
+    // company configuration is reported as `ok` with its provenance, not as
+    // broken. The worker never reads configuration itself, so there is no read
+    // that can be refused; the only unhealthy state left is an open circuit
+    // breaker.
     return {
-      status: anyCircuitOpen || configDenied ? "degraded" : "ok",
-      message: configDenied
-        ? `Running on default configuration: ${runtime.lastBootstrapError}`
-        : undefined,
+      status: anyCircuitOpen ? "degraded" : "ok",
       details: {
         activeSessions: activeCount,
         circuitBreakers,
@@ -923,8 +833,6 @@ const plugin = definePlugin({
         configSource: runtime.configSource,
         configCompanyId: runtime.companyId,
         configBootstrapped: runtime.bootstrapped,
-        lastConfigError: runtime.lastBootstrapError,
-        lastCompanyListingError: runtime.lastCompanyListingError,
       },
     };
   },
