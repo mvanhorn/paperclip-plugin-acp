@@ -41,10 +41,11 @@ type HostMock = {
 };
 
 function createHost(opts: {
-  /** Stored config rows by company id. A missing entry means the read is denied. */
+  /**
+   * Stored config rows by company id. The plugin never reads them — they exist
+   * so a test can prove a readable row is still not read.
+   */
   configs?: Record<string, Record<string, unknown>>;
-  /** Intercepts `config.get` entirely — used for the in-flight read race. */
-  configGet?: (companyId?: string) => Promise<Record<string, unknown>>;
 } = {}): HostMock {
   const configGetCalls: Array<string | undefined> = [];
   const stateWrites: string[] = [];
@@ -58,7 +59,6 @@ function createHost(opts: {
     config: {
       async get(companyId?: string) {
         configGetCalls.push(companyId);
-        if (opts.configGet) return opts.configGet(companyId);
         // The gate the whole fix exists for: an unscoped read always throws.
         if (!companyId) throw new Error(SCOPE_DENIED);
         const row = opts.configs?.[companyId];

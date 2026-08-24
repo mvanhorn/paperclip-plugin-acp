@@ -9,12 +9,13 @@
  * the whole worker down with it — no tools, no listeners, no reaper.
  *
  * The fix is to stop treating configuration as a startup prerequisite. The
- * worker always boots on safe defaults, registers everything, and then adopts a
- * company's configuration when the host provides one:
- *
- *   1. `onConfigChanged` — the host replays stored configuration at worker start
- *      (Paperclip >= v2026.817.0) and delivers every save, with the scope;
- *   2. the first company-scoped invocation, when nothing has been adopted yet.
+ * worker always boots on safe defaults, registers everything, and adopts a
+ * company's configuration only when the host delivers one through
+ * `onConfigChanged` — the host replays stored configuration at worker start
+ * (Paperclip >= v2026.817.0) and delivers every save, with the company scope
+ * attached. The worker never reads configuration itself: a scoped `config.get`
+ * does not move the SDK's own owner, so adopting from a read would let the two
+ * layers disagree about who owns the worker.
  *
  * Single-runtime company model, mirroring the SDK's own single-tenant guard so
  * the two never disagree about who owns the worker: the first delivered company
@@ -28,14 +29,15 @@
 import { DEFAULT_CONFIG, ORCHESTRATION_DEFAULTS } from "./constants.js";
 import type { AcpConfig, AcpSessionMode } from "./types.js";
 
-/** Where the currently active configuration came from. */
+/**
+ * Where the currently active configuration came from. A delivery is the only
+ * way to adopt one, so there are exactly two states.
+ */
 export type ConfigSource =
   /** No company config has landed yet — every value is a built-in default. */
   | "defaults"
   /** Adopted from an `onConfigChanged` delivery by the host. */
-  | "config-changed"
-  /** Adopted from the first company-scoped invocation (event or tool call). */
-  | "invocation";
+  | "config-changed";
 
 /** Snapshot of the bootstrap state, surfaced through `onHealth`. */
 export type RuntimeConfigState = {
