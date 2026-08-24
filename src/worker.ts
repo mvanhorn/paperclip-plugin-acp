@@ -90,33 +90,19 @@ function currentEnabledAgents(): ReturnType<typeof parseEnabledAgents> {
 function adoptConfig(
   ctx: PluginContext,
   raw: unknown,
-  opts: {
-    companyId: string | null;
-    source: ConfigSource;
-    /** Sequence captured before an awaited host read; see `applyCompanyConfig`. */
-    expectedSequence?: number;
-  },
+  opts: { companyId: string | null; source: ConfigSource },
 ): boolean {
   const result = applyCompanyConfig(raw, opts);
 
   if (!result.applied) {
-    if (result.skippedReason === "stale-snapshot") {
-      // A newer configuration landed while our read was in flight. Dropping the
-      // older snapshot keeps the most recent save authoritative.
-      ctx.logger.info("Discarding a configuration read that resolved after a newer save", {
-        companyId: opts.companyId,
+    ctx.logger.warn(
+      "Ignoring config for a second company — this plugin runs a single company runtime",
+      {
+        runningCompanyId: result.companyId,
+        ignoredCompanyId: opts.companyId,
         source: opts.source,
-      });
-    } else {
-      ctx.logger.warn(
-        "Ignoring config for a second company — this plugin runs a single company runtime",
-        {
-          runningCompanyId: result.companyId,
-          ignoredCompanyId: opts.companyId,
-          source: opts.source,
-        },
-      );
-    }
+      },
+    );
     return false;
   }
 

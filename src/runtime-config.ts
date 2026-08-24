@@ -47,12 +47,6 @@ export type RuntimeConfigState = {
   source: ConfigSource;
   /** Human-readable provenance, e.g. `company:8f2c-…` — safe for health output. */
   configSource: string;
-  /**
-   * Monotonic counter, incremented on every adoption. Callers that await a host
-   * read capture it beforehand and pass it back as `expectedSequence`, so a slow
-   * read can never overwrite a newer configuration that landed meanwhile.
-   */
-  sequence: number;
 };
 
 /** Result of an attempted config adoption. */
@@ -60,12 +54,10 @@ export type ApplyConfigResult = {
   /** True when the incoming config became the active one. */
   applied: boolean;
   /**
-   * Why an adoption was skipped, when `applied` is false.
-   *
-   * - `other-company`: a second company's config arrived while one is running.
-   * - `stale-snapshot`: the caller's read resolved after a newer config landed.
+   * Why an adoption was skipped, when `applied` is false. A second company's
+   * config arrived while one is running.
    */
-  skippedReason?: "other-company" | "stale-snapshot";
+  skippedReason?: "other-company";
   /**
    * True when ownership moved to a different company because its configuration
    * was identical to the running one. The SDK's guard allows exactly this (an
@@ -127,7 +119,6 @@ let current: AcpConfig = defaultConfig();
 let bootstrapped = false;
 let activeCompanyId: string | null = null;
 let source: ConfigSource = "defaults";
-let sequence = 0;
 /**
  * The raw configuration exactly as the host last delivered it. Ownership
  * decisions compare against this rather than the merged view, because the SDK's
@@ -147,16 +138,7 @@ export function getRuntimeConfigState(): RuntimeConfigState {
     companyId: activeCompanyId,
     source,
     configSource: describeSource(),
-    sequence,
   };
-}
-
-/**
- * The current adoption sequence. Capture this before awaiting a host config
- * read and hand it back to `applyCompanyConfig` as `expectedSequence`.
- */
-export function getConfigSequence(): number {
-  return sequence;
 }
 
 function describeSource(): string {
@@ -185,26 +167,8 @@ export function getActiveCompanyId(): string | null {
  */
 export function applyCompanyConfig(
   raw: unknown,
-  opts: {
-    companyId: string | null;
-    source: ConfigSource;
-    /**
-     * The sequence observed before the caller awaited a host read. When it no
-     * longer matches, a newer configuration landed while that read was in
-     * flight and this snapshot is dropped instead of overwriting it.
-     */
-    expectedSequence?: number;
-  },
+  opts: { companyId: string | null; source: ConfigSource },
 ): ApplyConfigResult {
-  if (opts.expectedSequence !== undefined && opts.expectedSequence !== sequence) {
-    return {
-      applied: false,
-      skippedReason: "stale-snapshot",
-      reaperIntervalChanged: false,
-      companyId: activeCompanyId,
-    };
-  }
-
   // Mirror of the SDK's fail-closed cross-tenant guard
   // (`handleConfigChanged` in worker-rpc-host): a different company is refused
   // only when it brings a DIFFERENT configuration. An identical configuration
@@ -238,7 +202,6 @@ export function applyCompanyConfig(
   source = opts.source;
   if (opts.companyId !== null) activeCompanyId = opts.companyId;
   lastRawConfig = raw;
-  sequence += 1;
 
   return {
     applied: true,
@@ -279,5 +242,4 @@ export function resetRuntimeConfig(): void {
   activeCompanyId = null;
   source = "defaults";
   lastRawConfig = undefined;
-  sequence = 0;
 }
